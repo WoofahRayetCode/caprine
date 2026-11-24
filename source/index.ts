@@ -5,7 +5,7 @@ import {
 	nativeImage,
 	screen as electronScreen,
 	session,
-	shell,
+	ipcMain,
 	BrowserWindow,
 	Menu,
 	Notification,
@@ -19,27 +19,26 @@ import electronDl from 'electron-dl';
 import electronContextMenu from 'electron-context-menu';
 import electronLocalshortcut from 'electron-localshortcut';
 import electronDebug from 'electron-debug';
-import {is, darkMode} from 'electron-util';
-import {bestFacebookLocaleFor} from 'facebook-locales';
+import {is} from 'electron-util';
 import doNotDisturb from '@sindresorhus/do-not-disturb';
 import updateAppMenu from './menu';
 import config, {StoreType} from './config';
 import tray from './tray';
 import {
 	sendAction,
-	sendBackgroundAction,
-	messengerDomain,
+	setMainWindow,
 	stripTrackingFromUrl,
 } from './util';
 import {process as processEmojiUrl} from './emoji';
-import ensureOnline from './ensure-online';
 import {setUpMenuBarMode} from './menu-bar-mode';
 import {caprineIconPath} from './constants';
+import {classifyUrl, isMessagesThreadUrl, isMessagesUrl} from './navigation';
+import {configureNavigation, loadMessages, openExternal} from './window-navigation';
 
 ipc.setMaxListeners(100);
 
 electronDebug({
-	isEnabled: true, // TODO: This is only enabled to allow `Command+R` because messenger.com sometimes gets stuck after computer waking up
+	isEnabled: true, // TODO: This is only enabled to allow `Command+R` because Facebook Messages sometimes gets stuck after computer waking up
 	showDevTools: false,
 });
 
@@ -66,20 +65,17 @@ if (!config.get('hardwareAcceleration')) {
 }
 
 if (!is.development && config.get('autoUpdate')) {
-	(async () => {
-		const FOUR_HOURS = 1000 * 60 * 60 * 4;
-		setInterval(async () => {
-			await autoUpdater.checkForUpdatesAndNotify();
-		}, FOUR_HOURS);
+	const checkForUpdates = (): void => {
+		void autoUpdater.checkForUpdatesAndNotify().catch(console.error);
+	};
 
-		await autoUpdater.checkForUpdatesAndNotify();
-	})();
+	setInterval(checkForUpdates, 1000 * 60 * 60 * 4);
+	checkForUpdates();
 }
 
 let mainWindow: BrowserWindow;
 let isQuitting = false;
 let previousMessageCount = 0;
-let dockMenu: Menu;
 let isDNDEnabled = false;
 
 if (!app.requestSingleInstanceLock()) {
@@ -99,46 +95,43 @@ app.on('second-instance', () => {
 // Preserves the window position when a display is removed and Caprine is moved to a different screen.
 app.on('ready', () => {
 	electronScreen.on('display-removed', () => {
-		const [x, y] = mainWindow.getPosition();
-		mainWindow.setPosition(x, y);
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			const [x, y] = mainWindow.getPosition();
+			mainWindow.setPosition(x, y);
+		}
 	});
 });
 
 async function updateBadge(messageCount: number): Promise<void> {
 	if (!is.windows) {
-		if (config.get('showUnreadBadge') && !isDNDEnabled) {
-			app.badgeCount = messageCount;
-		}
+		app.badgeCount = config.get('showUnreadBadge') && !isDNDEnabled ? messageCount : 0;
 
 		if (
 			is.macos
 			&& !isDNDEnabled
 			&& config.get('bounceDockOnMessage')
-			&& previousMessageCount !== messageCount
+			&& previousMessageCount < messageCount
 		) {
-			app.dock.bounce('informational');
-			previousMessageCount = messageCount;
+			app.dock?.bounce('informational');
 		}
 	}
 
-	if (!is.macos) {
-		if (config.get('showUnreadBadge')) {
-			tray.setBadge(messageCount > 0);
-		}
-
-		if (config.get('flashWindowOnMessage')) {
-			mainWindow.flashFrame(messageCount !== 0);
-		}
+	if (!is.macos && config.get('flashWindowOnMessage')) {
+		mainWindow.flashFrame(messageCount > previousMessageCount && !mainWindow.isFocused());
 	}
 
-	tray.update(messageCount);
+	previousMessageCount = messageCount;
+	tray.update(config.get('showUnreadBadge') ? messageCount : 0);
 
 	if (is.windows) {
 		if (!config.get('showUnreadBadge') || messageCount === 0) {
 			mainWindow.setOverlayIcon(null, '');
 		} else {
 			// Delegate drawing of overlay icon to renderer process
-			updateOverlayIcon(await ipc.callRenderer(mainWindow, 'render-overlay-icon', messageCount));
+			const overlay = await ipc.callRenderer<number, {data: string; text: string}>(mainWindow, 'render-overlay-icon', messageCount);
+			if (previousMessageCount === messageCount) {
+				updateOverlayIcon(overlay);
+			}
 		}
 	}
 }
@@ -148,123 +141,49 @@ function updateOverlayIcon({data, text}: {data: string; text: string}): void {
 	mainWindow.setOverlayIcon(img, text);
 }
 
-type BeforeSendHeadersResponse = {
-	cancel?: boolean;
-	requestHeaders?: Record<string, string>;
-};
-
-type OnSendHeadersDetails = {
-	id: number;
-	url: string;
-	method: string;
-	webContentsId?: number;
-	resourceType: string;
-	referrer: string;
-	timestamp: number;
-	requestHeaders: Record<string, string>;
-};
-
-function enableHiresResources(): void {
-	const scaleFactor = Math.max(
-		...electronScreen.getAllDisplays().map(display => display.scaleFactor),
-	);
-
-	if (scaleFactor === 1) {
-		return;
-	}
-
-	const filter = {urls: [`*://*.${messengerDomain}/`]};
-
-	session.defaultSession.webRequest.onBeforeSendHeaders(
-		filter,
-		(details: OnSendHeadersDetails, callback: (response: BeforeSendHeadersResponse) => void) => {
-			let cookie = details.requestHeaders.Cookie;
-
-			if (cookie && details.method === 'GET') {
-				cookie = /(?:; )?dpr=\d/.test(cookie) ? cookie.replace(/dpr=\d/, `dpr=${scaleFactor}`) : `${cookie}; dpr=${scaleFactor}`;
-
-				(details.requestHeaders as any).Cookie = cookie;
-			}
-
-			callback({
-				cancel: false,
-				requestHeaders: details.requestHeaders,
-			});
-		},
-	);
-}
-
 function initRequestsFiltering(): void {
-	const filter = {
+	session.defaultSession.webRequest.onBeforeRequest({
 		urls: [
-			`*://*.${messengerDomain}/*typ.php*`, // Type indicator blocker
-			`*://*.${messengerDomain}/*change_read_status.php*`, // Seen indicator blocker
-			`*://*.${messengerDomain}/*delivery_receipts*`, // Delivery receipts indicator blocker
-			`*://*.${messengerDomain}/*unread_threads*`, // Delivery receipts indicator blocker
-			'*://*.fbcdn.net/images/emoji.php/v9/*', // Emoji
-			'*://*.facebook.com/images/emoji.php/v9/*', // Emoji
+			'https://*.fbcdn.net/images/emoji.php/v9/*',
+			'https://*.facebook.com/images/emoji.php/v9/*',
 		],
-	};
-
-	session.defaultSession.webRequest.onBeforeRequest(filter, async ({url}, callback) => {
-		if (url.includes('emoji.php')) {
-			callback(await processEmojiUrl(url));
-		} else if (url.includes('typ.php')) {
-			callback({cancel: config.get('block.typingIndicator' as any)});
-		} else if (url.includes('change_read_status.php')) {
-			callback({cancel: config.get('block.chatSeen' as any)});
-		} else if (url.includes('delivery_receipts') || url.includes('unread_threads')) {
-			callback({cancel: config.get('block.deliveryReceipt' as any)});
-		}
-	});
-
-	session.defaultSession.webRequest.onHeadersReceived({
-		urls: ['*://static.xx.fbcdn.net/rsrc.php/*'],
-	}, ({responseHeaders}, callback) => {
-		if (!config.get('callRingtoneMuted') || !responseHeaders) {
+	}, async ({url, webContentsId}, callback) => {
+		if (webContentsId !== mainWindow.webContents.id || !isMessagesUrl(mainWindow.webContents.getURL())) {
 			callback({});
 			return;
 		}
 
-		const callRingtoneHash = '2NAu/QVqg211BbktgY5GkA==';
-		callback({
-			cancel: responseHeaders['content-md5'][0] === callRingtoneHash,
-		});
+		try {
+			callback(await processEmojiUrl(url));
+		} catch (error) {
+			console.error(error);
+			callback({});
+		}
 	});
 }
 
-function setUserLocale(): void {
-	const userLocale = bestFacebookLocaleFor(app.getLocale().replace('-', '_'));
-	const cookie = {
-		url: 'https://www.messenger.com/',
-		name: 'locale',
-		secure: true,
-		value: userLocale,
-	};
+function answerRenderer<Data = unknown, Result = unknown>(
+	channel: string,
+	callback: (data: Data) => Result | Promise<Result>,
+	allowAccountPage = false,
+): void {
+	ipcMain.handle(channel, async (event, data: Data) => {
+		const {sender, senderFrame} = event;
+		if (!mainWindow || sender !== mainWindow.webContents || !senderFrame || senderFrame !== sender.mainFrame) {
+			return undefined;
+		}
 
-	session.defaultSession.cookies.set(cookie);
-}
+		const route = classifyUrl(senderFrame.url);
+		if (route === 'messages' || (allowAccountPage && route === 'account')) {
+			return callback(data);
+		}
 
-function setNotificationsMute(status: boolean): void {
-	const label = 'Mute Notifications';
-	const muteMenuItem = Menu.getApplicationMenu()!.getMenuItemById('mute-notifications')!;
-
-	config.set('notificationsMuted', status);
-	muteMenuItem.checked = status;
-
-	if (is.macos) {
-		const item = dockMenu.items.find(x => x.label === label);
-		item!.checked = status;
-	}
+		return undefined;
+	});
 }
 
 function createMainWindow(): BrowserWindow {
 	const lastWindowState = config.get('lastWindowState');
-
-	// Messenger or Work Chat
-	const mainURL = config.get('useWorkChat')
-		? 'https://work.facebook.com/chat'
-		: 'https://www.messenger.com/login/';
 
 	const win = new BrowserWindow({
 		title: app.name,
@@ -284,35 +203,23 @@ function createMainWindow(): BrowserWindow {
 		},
 		autoHideMenuBar: config.get('autoHideMenuBar'),
 		webPreferences: {
-			preload: path.join(__dirname, 'browser.js'),
+			preload: path.join(__dirname, 'browser-preload.cjs'),
 			contextIsolation: true,
-			nodeIntegration: true,
+			nodeIntegration: false,
+			sandbox: true,
 			spellcheck: config.get('isSpellCheckerEnabled'),
-			plugins: true,
 		},
-	});
-
-	require('@electron/remote/main').initialize();
-	require('@electron/remote/main').enable(win.webContents);
-
-	setUserLocale();
-	initRequestsFiltering();
-
-	let previousDarkMode = darkMode.isEnabled;
-	darkMode.onChange(() => {
-		if (darkMode.isEnabled !== previousDarkMode) {
-			previousDarkMode = darkMode.isEnabled;
-			win.webContents.send('set-theme');
-		}
 	});
 
 	if (is.macos) {
 		win.setSheetOffset(40);
 	}
 
-	win.loadURL(mainURL);
-
 	win.on('close', event => {
+		if (isQuitting) {
+			return;
+		}
+
 		if (config.get('quitOnWindowClose')) {
 			app.quit();
 			return;
@@ -365,51 +272,54 @@ function createMainWindow(): BrowserWindow {
 	return win;
 }
 
-(async () => {
-	await Promise.all([ensureOnline(), app.whenReady()]);
+async function initialize(): Promise<void> {
+	await app.whenReady();
 	await updateAppMenu();
 	mainWindow = createMainWindow();
+	setMainWindow(mainWindow);
+
+	const {webContents} = mainWindow;
+	configureNavigation(mainWindow);
+	initRequestsFiltering();
 
 	// Workaround for https://github.com/electron/electron/issues/5256
 	electronLocalshortcut.register(mainWindow, 'CommandOrControl+=', () => {
 		sendAction('zoom-in');
 	});
 
-	// Start in menu bar mode if enabled, otherwise start normally
 	setUpMenuBarMode(mainWindow);
-
-	if (is.macos) {
-		const firstItem: MenuItemConstructorOptions = {
+	const {dock} = app;
+	if (dock) {
+		const muteItem: MenuItemConstructorOptions = {
 			label: 'Mute Notifications',
 			type: 'checkbox',
-			visible: is.development,
 			checked: config.get('notificationsMuted'),
-			async click() {
-				setNotificationsMute(await ipc.callRenderer(mainWindow, 'toggle-mute-notifications'));
+			click(menuItem) {
+				config.set('notificationsMuted', menuItem.checked);
+				const appMenuItem = Menu.getApplicationMenu()?.getMenuItemById('mute-notifications');
+				if (appMenuItem) {
+					appMenuItem.checked = menuItem.checked;
+				}
 			},
 		};
 
-		dockMenu = Menu.buildFromTemplate([firstItem]);
-		app.dock.setMenu(dockMenu);
+		let menuItems: MenuItemConstructorOptions[] = [];
+		const updateDockMenu = (): void => {
+			muteItem.checked = config.get('notificationsMuted');
+			const separator: MenuItemConstructorOptions[] = menuItems.length > 0 ? [{type: 'separator'}] : [];
+			dock.setMenu(Menu.buildFromTemplate([muteItem, ...separator, ...menuItems]));
+		};
 
-		// Dock icon is hidden initially on macOS
+		updateDockMenu();
+		config.onDidChange('notificationsMuted', updateDockMenu);
 		if (config.get('showDockIcon')) {
-			app.dock.show();
+			dock.show();
 		}
 
-		ipc.once('conversations', () => {
-			// Messenger sorts the conversations by unread state.
-			// We select the first conversation from the list.
-			sendAction('jump-to-conversation', 1);
-		});
-
-		ipc.answerRenderer('conversations', (conversations: Conversation[]) => {
-			if (conversations.length === 0) {
-				return;
-			}
-
-			const items = conversations.map(({label, icon}, index) => ({
-				label: `${label}`,
+		const {updateTouchBar} = await import('./touch-bar');
+		answerRenderer('conversations', (conversations: Conversation[]) => {
+			menuItems = conversations.map(({label, icon}, index) => ({
+				label,
 				icon: nativeImage.createFromDataURL(icon),
 				click() {
 					mainWindow.show();
@@ -417,47 +327,90 @@ function createMainWindow(): BrowserWindow {
 				},
 			}));
 
-			app.dock.setMenu(Menu.buildFromTemplate([firstItem, {type: 'separator'}, ...items]));
+			updateDockMenu();
+			updateTouchBar(conversations);
+		});
+		webContents.on('did-navigate', () => {
+			menuItems = [];
+			updateDockMenu();
+			updateTouchBar([]);
+		});
+
+		void doNotDisturb.isEnabled().then((enabled: boolean) => {
+			isDNDEnabled = enabled;
+		}).catch(console.error);
+		doNotDisturb.on('change', (enabled: boolean) => {
+			isDNDEnabled = enabled;
 		});
 	}
 
-	// Update badge on conversations change
-	ipc.answerRenderer('update-tray-icon', async (messageCount: number) => {
-		updateBadge(messageCount);
+	answerRenderer('update-tray-icon', async (count: number) => {
+		if (Number.isSafeInteger(count) && count >= 0) {
+			await updateBadge(count);
+		}
 	});
 
-	enableHiresResources();
+	nativeTheme.on('updated', () => {
+		if (isMessagesUrl(webContents.getURL())) {
+			sendAction('set-theme');
+		}
+	});
 
-	const {webContents} = mainWindow;
+	const styles = ['browser.css', 'dark-mode.css', 'vibrancy.css', 'code-blocks.css', 'autoplay.css', 'scrollbar.css']
+		.map(file => path.join(__dirname, '..', 'css', file));
+	const customStyle = path.join(app.getPath('userData'), 'custom.css');
+	let styleKey: string | undefined;
+	let stylesInMessages = false;
+	let styleRevision = 0;
 
-	webContents.on('dom-ready', async () => {
-		// Set window title to Caprine
-		mainWindow.setTitle(app.name);
+	async function applyStyles(url: string, newDocument = false): Promise<void> {
+		const inMessages = isMessagesUrl(url);
+		if (!newDocument && inMessages === stylesInMessages) {
+			return;
+		}
 
-		await updateAppMenu();
+		stylesInMessages = inMessages;
+		const revision = ++styleRevision;
+		const previousKey = styleKey;
+		styleKey = undefined;
+		if (!newDocument && previousKey) {
+			await webContents.removeInsertedCSS(previousKey);
+		}
 
-		const files = ['browser.css', 'dark-mode.css', 'vibrancy.css', 'code-blocks.css', 'autoplay.css', 'scrollbar.css'];
-
-		const cssPath = path.join(__dirname, '..', 'css');
-
-		for (const file of files) {
-			if (existsSync(path.join(cssPath, file))) {
-				webContents.insertCSS(readFileSync(path.join(cssPath, file), 'utf8'));
+		if (inMessages) {
+			const css = [...styles, customStyle].filter(file => existsSync(file)).map(file => readFileSync(file, 'utf8')).join('\n');
+			const key = await webContents.insertCSS(css);
+			if (revision === styleRevision) {
+				styleKey = key;
+			} else {
+				await webContents.removeInsertedCSS(key);
 			}
 		}
+	}
 
-		if (config.get('useWorkChat') && existsSync(path.join(cssPath, 'workchat.css'))) {
-			webContents.insertCSS(
-				readFileSync(path.join(cssPath, 'workchat.css'), 'utf8'),
-			);
+	webContents.on('dom-ready', () => {
+		mainWindow.setTitle(app.name);
+		void applyStyles(webContents.getURL(), true).catch(console.error);
+	});
+	webContents.on('page-title-updated', event => {
+		event.preventDefault();
+	});
+	webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+		if (isMainFrame) {
+			void applyStyles(url).catch(console.error);
+		}
+	});
+	webContents.on('did-navigate', () => {
+		for (const notification of notifications.values()) {
+			notification.close();
 		}
 
-		if (existsSync(path.join(app.getPath('userData'), 'custom.css'))) {
-			webContents.insertCSS(readFileSync(path.join(app.getPath('userData'), 'custom.css'), 'utf8'));
-		}
+		notifications.clear();
+		void updateBadge(0).catch(console.error);
+	});
 
-		if (config.get('launchMinimized') || app.getLoginItemSettings().wasOpenedAsHidden) {
-			mainWindow.hide();
+	mainWindow.once('ready-to-show', () => {
+		if (config.get('launchMinimized')) {
 			tray.create(mainWindow);
 		} else {
 			if (config.get('lastWindowState').isMaximized) {
@@ -466,116 +419,17 @@ function createMainWindow(): BrowserWindow {
 
 			mainWindow.show();
 		}
-
-		if (is.macos) {
-			// TODO: 'update-dnd-mode' is not called
-			ipc.answerRenderer('update-dnd-mode', async (initialSoundsValue: boolean) => {
-				doNotDisturb.on('change', (doNotDisturb: boolean) => {
-					isDNDEnabled = doNotDisturb;
-					ipc.callRenderer(mainWindow, 'toggle-sounds', {checked: isDNDEnabled ? false : initialSoundsValue});
-				});
-
-				isDNDEnabled = await doNotDisturb.isEnabled();
-
-				return isDNDEnabled ? false : initialSoundsValue;
-			});
-		}
-
-		// TODO: Re-enable this when muting notifications is fixed
-		// setNotificationsMute(await ipc.callRenderer(mainWindow, 'toggle-mute-notifications', {
-		// 	defaultStatus: config.get('notificationsMuted'),
-		// }));
-
-		ipc.callRenderer(mainWindow, 'toggle-message-buttons', config.get('showMessageButtons'));
-
-		await webContents.executeJavaScript(
-			readFileSync(path.join(__dirname, 'notifications-isolated.js'), 'utf8'),
-		);
-
-		if (is.macos) {
-			await import('./touch-bar');
-		}
 	});
+	loadMessages(mainWindow);
+}
 
-	webContents.setWindowOpenHandler(details => {
-		if (details.disposition === 'foreground-tab' || details.disposition === 'background-tab') {
-			const url = stripTrackingFromUrl(details.url);
-			shell.openExternal(url);
-			return {action: 'deny'};
-		}
-
-		if (details.disposition === 'new-window') {
-			if (details.url === 'about:blank' || details.url === 'about:blank#blocked') {
-				if (details.frameName !== 'about:blank') {
-					// Voice/video call popup
-					return {
-						action: 'allow',
-						overrideBrowserWindowOptions: {
-							show: true,
-							titleBarStyle: 'default',
-							webPreferences: {
-								nodeIntegration: false,
-								preload: path.join(__dirname, 'browser-call.js'),
-							},
-						},
-					};
-				}
-			} else {
-				const url = stripTrackingFromUrl(details.url);
-				shell.openExternal(url);
-			}
-
-			return {action: 'deny'};
-		}
-
-		return {action: 'allow'};
-	});
-
-	webContents.on('will-navigate', async (event, url) => {
-		const isMessengerDotCom = (url: string): boolean => {
-			const {hostname} = new URL(url);
-			return hostname.endsWith('.messenger.com');
-		};
-
-		const isTwoFactorAuth = (url: string): boolean => {
-			const twoFactorAuthURL = 'https://www.facebook.com/checkpoint';
-			return url.startsWith(twoFactorAuthURL);
-		};
-
-		const isWorkChat = (url: string): boolean => {
-			const {hostname, pathname} = new URL(url);
-
-			if (hostname === 'work.facebook.com' || hostname === 'work.workplace.com') {
-				return true;
-			}
-
-			if (
-				// Example: https://company-name.facebook.com/login or
-				//   		https://company-name.workplace.com/login
-				(hostname.endsWith('.facebook.com') || hostname.endsWith('.workplace.com'))
-				&& (pathname.startsWith('/login') || pathname.startsWith('/chat'))
-			) {
-				return true;
-			}
-
-			if (hostname === 'login.microsoftonline.com') {
-				return true;
-			}
-
-			return false;
-		};
-
-		if (isMessengerDotCom(url) || isTwoFactorAuth(url) || isWorkChat(url)) {
-			return;
-		}
-
-		event.preventDefault();
-		await shell.openExternal(url);
-	});
-})();
+void initialize().catch(error => {
+	console.error(error);
+	app.quit();
+});
 
 if (is.macos) {
-	ipc.answerRenderer('set-vibrancy', () => {
+	answerRenderer('set-vibrancy', () => {
 		mainWindow.setBackgroundColor('#80FFFFFF'); // Transparent, workaround for vibrancy issue.
 		mainWindow.setVibrancy('sidebar');
 	});
@@ -589,7 +443,7 @@ function toggleMaximized(): void {
 	}
 }
 
-ipc.answerRenderer('titlebar-doubleclick', () => {
+answerRenderer('titlebar-doubleclick', () => {
 	if (is.macos) {
 		const doubleClickAction = systemPreferences.getUserDefault('AppleActionOnDoubleClick', 'string');
 
@@ -620,66 +474,80 @@ app.on('before-quit', () => {
 	}
 });
 
-const notifications = new Map();
+const notifications = new Map<number, Notification>();
 
-ipc.answerRenderer(
-	'notification',
-	({id, title, body, icon, silent}: {id: number; title: string; body: string; icon: string; silent: boolean}) => {
-		// Don't send notifications when the window is focused
-		if (mainWindow.isFocused()) {
-			return;
+answerRenderer('notification', (event: NotificationEvent) => {
+	if (
+		!event
+		|| !Number.isSafeInteger(event.id)
+		|| typeof event.title !== 'string'
+		|| typeof event.body !== 'string'
+		|| typeof event.conversationUrl !== 'string'
+		|| !isMessagesThreadUrl(event.conversationUrl)
+		|| config.get('notificationsMuted')
+		|| isDNDEnabled
+		|| mainWindow.isFocused()
+	) {
+		return;
+	}
+
+	const {id, title, body, icon, silent, conversationUrl} = event;
+	const notification = new Notification({
+		title,
+		body: config.get('notificationMessagePreview') ? body : 'You have a new message',
+		hasReply: is.macos,
+		icon: typeof icon === 'string' && icon.startsWith('data:image/png;base64,')
+			? nativeImage.createFromDataURL(icon)
+			: caprineIconPath,
+		silent,
+	});
+
+	notifications.get(id)?.close();
+	notifications.set(id, notification);
+
+	function forget(): void {
+		if (notifications.get(id) === notification) {
+			notifications.delete(id);
+		}
+	}
+
+	notification.on('click', () => {
+		mainWindow.show();
+		void mainWindow.loadURL(conversationUrl).catch(console.error);
+		forget();
+	});
+	notification.on('reply', (_event, reply) => {
+		if (isMessagesUrl(mainWindow.webContents.getURL())) {
+			void ipc.callRenderer(mainWindow, 'notification-reply-callback', {conversationUrl, reply}).catch(console.error);
 		}
 
-		const notification = new Notification({
-			title,
-			body: config.get('notificationMessagePreview') ? body : 'You have a new message',
-			hasReply: true,
-			icon: nativeImage.createFromDataURL(icon),
-			silent,
-		});
-
-		notifications.set(id, notification);
-
-		notification.on('click', () => {
-			sendAction('notification-callback', {callbackName: 'onclick', id});
-
-			notifications.delete(id);
-		});
-
-		notification.on('reply', (_event, reply: string) => {
-			// We use onclick event used by messenger to go to the right convo
-			sendBackgroundAction('notification-reply-callback', {callbackName: 'onclick', id, reply});
-
-			notifications.delete(id);
-		});
-
-		notification.on('close', () => {
-			sendBackgroundAction('notification-callback', {callbackName: 'onclose', id});
-			notifications.delete(id);
-		});
-
-		notification.show();
-	},
-);
+		forget();
+	});
+	notification.on('close', forget);
+	notification.show();
+});
 
 type ThemeSource = typeof nativeTheme.themeSource;
 
-ipc.answerRenderer<undefined, StoreType['useWorkChat']>('get-config-useWorkChat', async () => config.get('useWorkChat'));
-ipc.answerRenderer<undefined, StoreType['showMessageButtons']>('get-config-showMessageButtons', async () => config.get('showMessageButtons'));
-ipc.answerRenderer<undefined, ThemeSource>('get-config-theme', async () => config.get('theme'));
-ipc.answerRenderer<undefined, StoreType['privateMode']>('get-config-privateMode', async () => config.get('privateMode'));
-ipc.answerRenderer<undefined, StoreType['vibrancy']>('get-config-vibrancy', async () => config.get('vibrancy'));
-ipc.answerRenderer<undefined, StoreType['sidebar']>('get-config-sidebar', async () => config.get('sidebar'));
-ipc.answerRenderer<undefined, StoreType['zoomFactor']>('get-config-zoomFactor', async () => config.get('zoomFactor'));
-ipc.answerRenderer<StoreType['zoomFactor'], void>('set-config-zoomFactor', async zoomFactor => {
-	config.set('zoomFactor', zoomFactor);
+answerRenderer('open-external', (url: string) => {
+	if (typeof url === 'string' && classifyUrl(url) === 'external') {
+		openExternal(url);
+	}
 });
-ipc.answerRenderer<undefined, StoreType['keepMeSignedIn']>('get-config-keepMeSignedIn', async () => config.get('keepMeSignedIn'));
-ipc.answerRenderer<StoreType['keepMeSignedIn'], void>('set-config-keepMeSignedIn', async keepMeSignedIn => {
-	config.set('keepMeSignedIn', keepMeSignedIn);
-});
-ipc.answerRenderer<undefined, StoreType['autoplayVideos']>('get-config-autoplayVideos', async () => config.get('autoplayVideos'));
-ipc.answerRenderer<undefined, StoreType['emojiStyle']>('get-config-emojiStyle', async () => config.get('emojiStyle'));
-ipc.answerRenderer<StoreType['emojiStyle'], void>('set-config-emojiStyle', async emojiStyle => {
+answerRenderer('get-system-dark-mode', () => nativeTheme.shouldUseDarkColors, true);
+answerRenderer('get-config-showMessageButtons', () => config.get('showMessageButtons'));
+answerRenderer<undefined, ThemeSource>('get-config-theme', () => config.get('theme'));
+answerRenderer('get-config-privateMode', () => config.get('privateMode'));
+answerRenderer('get-config-vibrancy', () => config.get('vibrancy'));
+answerRenderer('get-config-sidebar', () => config.get('sidebar'));
+answerRenderer('get-config-zoomFactor', () => config.get('zoomFactor'), true);
+answerRenderer('set-config-zoomFactor', (zoomFactor: number) => {
+	if (Number.isFinite(zoomFactor) && zoomFactor > 0) {
+		config.set('zoomFactor', zoomFactor);
+	}
+}, true);
+answerRenderer('get-config-autoplayVideos', () => config.get('autoplayVideos'));
+answerRenderer('get-config-emojiStyle', () => config.get('emojiStyle'));
+answerRenderer('set-config-emojiStyle', (emojiStyle: StoreType['emojiStyle']) => {
 	config.set('emojiStyle', emojiStyle);
 });

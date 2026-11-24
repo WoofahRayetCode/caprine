@@ -1,11 +1,11 @@
-import {ipcRenderer as ipc} from 'electron-better-ipc';
+import {callMain} from './renderer-ipc';
 import selectors from './browser/selectors';
 
 const conversationId = 'conversationWindow';
 const disabledVideoId = 'disabled_autoplay';
 
 export async function toggleVideoAutoplay(): Promise<void> {
-	const autoplayVideos = await ipc.callMain<undefined, boolean>('get-config-autoplayVideos');
+	const autoplayVideos = await callMain<undefined, boolean>('get-config-autoplayVideos');
 	if (autoplayVideos) {
 		// Stop the observers
 		conversationDivObserver.disconnect();

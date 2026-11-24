@@ -27,6 +27,7 @@ import {
 import {generateSubmenu as generateEmojiSubmenu} from './emoji';
 import {toggleMenuBarMode} from './menu-bar-mode';
 import {caprineIconPath} from './constants';
+import {loadMessages} from './window-navigation';
 
 export default async function updateMenu(): Promise<Menu> {
 	const newConversationItem: MenuItemConstructorOptions = {
@@ -37,33 +38,11 @@ export default async function updateMenu(): Promise<Menu> {
 		},
 	};
 
-	const newRoomItem: MenuItemConstructorOptions = {
-		label: 'New Room',
-		accelerator: 'CommandOrControl+O',
-		click() {
-			sendAction('new-room');
-		},
-	};
-
-	const switchItems: MenuItemConstructorOptions[] = [
+	const sessionItems: MenuItemConstructorOptions[] = [
 		{
-			label: 'Switch to Work Chat…',
-			accelerator: 'CommandOrControl+Shift+2',
-			visible: !config.get('useWorkChat'),
+			label: 'Open Facebook Messages',
 			click() {
-				config.set('useWorkChat', true);
-				app.relaunch();
-				app.quit();
-			},
-		},
-		{
-			label: 'Switch to Messenger…',
-			accelerator: 'CommandOrControl+Shift+1',
-			visible: config.get('useWorkChat'),
-			click() {
-				config.set('useWorkChat', false);
-				app.relaunch();
-				app.quit();
+				loadMessages(getWindow());
 			},
 		},
 		{
@@ -185,33 +164,6 @@ export default async function updateMenu(): Promise<Menu> {
 		},
 	];
 
-	const privacySubmenu: MenuItemConstructorOptions[] = [
-		{
-			label: 'Block Seen Indicator',
-			type: 'checkbox',
-			checked: config.get('block.chatSeen' as any),
-			click(menuItem) {
-				config.set('block.chatSeen' as any, menuItem.checked);
-			},
-		},
-		{
-			label: 'Block Typing Indicator',
-			type: 'checkbox',
-			checked: config.get('block.typingIndicator' as any),
-			click(menuItem) {
-				config.set('block.typingIndicator' as any, menuItem.checked);
-			},
-		},
-		{
-			label: 'Block Delivery Receipts',
-			type: 'checkbox',
-			checked: config.get('block.deliveryReceipt' as any),
-			click(menuItem) {
-				config.set('block.deliveryReceipt' as any, menuItem.checked);
-			},
-		},
-	];
-
 	const advancedSubmenu: MenuItemConstructorOptions[] = [
 		{
 			label: 'Custom Styles',
@@ -236,13 +188,6 @@ Press Command/Ctrl+R in Caprine to see your changes.
 	];
 
 	const preferencesSubmenu: MenuItemConstructorOptions[] = [
-		{
-			/* TODO: Fix privacy features */
-			/* If you want to help, see #1688 */
-			label: 'Privacy',
-			visible: is.development,
-			submenu: privacySubmenu,
-		},
 		{
 			label: 'Emoji Style',
 			submenu: await generateEmojiSubmenu(updateMenu),
@@ -270,39 +215,29 @@ Press Command/Ctrl+R in Caprine to see your changes.
 			},
 		},
 		{
-			/* TODO: Fix notifications */
 			label: 'Show Message Preview in Notifications',
 			type: 'checkbox',
-			visible: is.development,
 			checked: config.get('notificationMessagePreview'),
 			click(menuItem) {
 				config.set('notificationMessagePreview', menuItem.checked);
 			},
 		},
 		{
-			/* TODO: Fix notifications */
 			label: 'Mute Notifications',
 			id: 'mute-notifications',
 			type: 'checkbox',
-			visible: is.development,
 			checked: config.get('notificationsMuted'),
-			click() {
-				sendAction('toggle-mute-notifications');
+			click(menuItem) {
+				config.set('notificationsMuted', menuItem.checked);
 			},
 		},
 		{
 			label: 'Mute Call Ringtone',
-			type: 'checkbox',
-			checked: config.get('callRingtoneMuted'),
-			click() {
-				config.set('callRingtoneMuted', !config.get('callRingtoneMuted'));
-			},
+			enabled: false,
 		},
 		{
-			/* TODO: Fix notification badge */
 			label: 'Show Unread Badge',
 			type: 'checkbox',
-			visible: is.development,
 			checked: config.get('showUnreadBadge'),
 			click() {
 				config.set('showUnreadBadge', !config.get('showUnreadBadge'));
@@ -381,7 +316,6 @@ Press Command/Ctrl+R in Caprine to see your changes.
 			click(menuItem) {
 				app.setLoginItemSettings({
 					openAtLogin: menuItem.checked,
-					openAsHidden: menuItem.checked,
 				});
 			},
 		},
@@ -413,10 +347,8 @@ Press Command/Ctrl+R in Caprine to see your changes.
 			},
 		},
 		{
-			/* TODO: Fix notifications */
 			label: 'Flash Window on Message',
 			type: 'checkbox',
-			visible: is.development,
 			checked: config.get('flashWindowOnMessage'),
 			click(menuItem) {
 				config.set('flashWindowOnMessage', menuItem.checked);
@@ -556,9 +488,7 @@ Press Command/Ctrl+R in Caprine to see your changes.
 		},
 		{
 			label: 'Show Marketplace Chats',
-			click() {
-				sendAction('show-marketplace-view');
-			},
+			enabled: false,
 		},
 		{
 			label: 'Show Message Requests',
@@ -768,7 +698,7 @@ ${debugInfo()}`;
 			{
 				type: 'separator',
 			},
-			...switchItems,
+			...sessionItems,
 			{
 				type: 'separator',
 			},
@@ -784,7 +714,7 @@ ${debugInfo()}`;
 			role: 'fileMenu',
 			submenu: [
 				newConversationItem,
-				newRoomItem,
+				{label: 'New Room', enabled: false},
 				{
 					type: 'separator',
 				},
@@ -818,7 +748,7 @@ ${debugInfo()}`;
 			role: 'fileMenu',
 			submenu: [
 				newConversationItem,
-				newRoomItem,
+				{label: 'New Room', enabled: false},
 				{
 					type: 'separator',
 				},
@@ -836,7 +766,7 @@ ${debugInfo()}`;
 				{
 					type: 'separator',
 				},
-				...switchItems,
+				...sessionItems,
 				{
 					type: 'separator',
 				},

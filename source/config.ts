@@ -1,6 +1,7 @@
 import Store from 'electron-store';
 import {is} from 'electron-util';
 import {EmojiStyle} from './emoji';
+import {removeLegacySettings} from './config-migration';
 
 export type StoreType = {
 	theme: 'system' | 'light' | 'dark';
@@ -32,7 +33,6 @@ export type StoreType = {
 		deliveryReceipt: boolean;
 	};
 	emojiStyle: EmojiStyle;
-	useWorkChat: boolean;
 	sidebar: 'default' | 'hidden' | 'narrow' | 'wide';
 	autoHideMenuBar: boolean;
 	autoUpdate: boolean;
@@ -40,7 +40,6 @@ export type StoreType = {
 	callRingtoneMuted: boolean;
 	hardwareAcceleration: boolean;
 	quitOnWindowClose: boolean;
-	keepMeSignedIn: boolean;
 	autoplayVideos: boolean;
 	isSpellCheckerEnabled: boolean;
 	spellCheckerLanguages: string[];
@@ -166,10 +165,6 @@ const schema: Store.Schema<StoreType> = {
 		enum: ['native', 'facebook-3-0', 'messenger-1-0', 'facebook-2-2'],
 		default: 'facebook-3-0',
 	},
-	useWorkChat: {
-		type: 'boolean',
-		default: false,
-	},
 	sidebar: {
 		type: 'string',
 		enum: ['default', 'hidden', 'narrow', 'wide'],
@@ -198,10 +193,6 @@ const schema: Store.Schema<StoreType> = {
 	quitOnWindowClose: {
 		type: 'boolean',
 		default: false,
-	},
-	keepMeSignedIn: {
-		type: 'boolean',
-		default: true,
 	},
 	autoplayVideos: {
 		type: 'boolean',
@@ -268,6 +259,13 @@ function updateThemeSetting(store: Store<StoreType>): void {
 }
 
 function migrate(store: Store<StoreType>): void {
+	removeLegacySettings({
+		has: key => store.has(key),
+		delete(key) {
+			// The removed keys can still exist in a profile written by an older version.
+			store.delete(key as keyof StoreType);
+		},
+	});
 	updateVibrancySetting(store);
 	updateSidebarSetting(store);
 	updateThemeSetting(store);

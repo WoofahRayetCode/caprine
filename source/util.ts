@@ -8,20 +8,33 @@ import {ipcMain} from 'electron-better-ipc';
 import {is} from 'electron-util';
 import config from './config';
 import tray from './tray';
+import {externalUrl, isMessagesUrl} from './navigation';
+
+let mainWindow: BrowserWindow;
+
+export function setMainWindow(window: BrowserWindow): void {
+	mainWindow = window;
+}
 
 export function getWindow(): BrowserWindow {
-	const [win] = BrowserWindow.getAllWindows();
-	return win;
+	return mainWindow;
 }
 
 export function sendAction<T>(action: string, arguments_?: T): void {
 	const win = getWindow();
+	if (!win || win.isDestroyed()) {
+		return;
+	}
 
 	if (is.macos) {
 		win.restore();
 	}
 
-	ipcMain.callRenderer(win, action, arguments_);
+	if (action === 'reload') {
+		win.webContents.reload();
+	} else if (isMessagesUrl(win.webContents.getURL()) || action.startsWith('zoom-')) {
+		void ipcMain.callRenderer(win, action, arguments_).catch(console.error);
+	}
 }
 
 export async function sendBackgroundAction<T, ReturnValue>(action: string, arguments_?: T): Promise<ReturnValue> {
@@ -49,15 +62,8 @@ export function showRestartDialog(message: string): void {
 	}
 }
 
-export const messengerDomain = config.get('useWorkChat') ? 'facebook.com' : 'messenger.com';
-
 export function stripTrackingFromUrl(url: string): string {
-	const trackingUrlPrefix = `https://l.${messengerDomain}/l.php`;
-	if (url.startsWith(trackingUrlPrefix)) {
-		url = new URL(url).searchParams.get('u')!;
-	}
-
-	return url;
+	return externalUrl(url) ?? url;
 }
 
 export const toggleTrayIcon = (): void => {

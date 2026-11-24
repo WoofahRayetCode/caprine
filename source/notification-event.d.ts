@@ -4,4 +4,5 @@ type NotificationEvent = {
 	body: string;
 	icon: string;
 	silent: boolean;
+	conversationUrl: string;
 };

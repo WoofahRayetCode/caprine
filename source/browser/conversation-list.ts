@@ -1,314 +1,293 @@
-import {ipcRenderer as ipc} from 'electron-better-ipc';
-import elementReady from 'element-ready';
-import {isNull} from 'lodash';
-import selectors from './selectors';
+/* eslint-disable n/prefer-global/process -- Electron supplies process to sandboxed preloads. */
+import {isMessagesThreadUrl, isMessagesUrl} from '../navigation';
+import {callMain} from '../renderer-ipc';
+import selectors, {getConversationLinks, getConversationUrl} from './selectors';
 
-const icon = {
-	read: 'data-caprine-icon',
-	unread: 'data-caprine-icon-unread',
+type ConversationRow = {
+	url: string;
+	title: string;
+	body: string;
+	avatar: string;
+	unread: boolean;
+	muted: boolean;
+	selected: boolean;
 };
 
-const padding = {
-	top: 3,
-	right: 0,
-	bottom: 3,
-	left: 0,
-};
+const imageTimeout = 2000;
+const rowUpdateDelay = 100;
+let updateVersion = 0;
 
-function drawIcon(size: number, img?: HTMLImageElement): HTMLCanvasElement {
-	const canvas = document.createElement('canvas');
-
-	if (img) {
-		canvas.width = size + padding.left + padding.right;
-		canvas.height = size + padding.top + padding.bottom;
-
-		const context = canvas.getContext('2d')!;
-		context.beginPath();
-		context.arc((size / 2) + padding.left, (size / 2) + padding.top, (size / 2), 0, Math.PI * 2, true);
-		context.closePath();
-		context.clip();
-
-		context.drawImage(img, padding.left, padding.top, size, size);
-	} else {
-		canvas.width = 0;
-		canvas.height = 0;
-	}
-
-	return canvas;
-}
-
-// Return canvas with rounded image
-async function urlToCanvas(url: string, size: number): Promise<HTMLCanvasElement> {
-	return new Promise(resolve => {
-		const img = new Image();
-
-		img.setAttribute('crossorigin', 'anonymous');
-
-		img.addEventListener('load', () => {
-			resolve(drawIcon(size, img));
-		});
-
-		img.addEventListener('error', () => {
-			console.error('Image not found', url);
-			resolve(drawIcon(size));
-		});
-
-		img.src = url;
-	});
-}
-
-async function createIcons(element: HTMLElement, url: string): Promise<void> {
-	const canvas = await urlToCanvas(url, 50);
-
-	element.setAttribute(icon.read, canvas.toDataURL());
-
-	const markerSize = 8;
-	const context = canvas.getContext('2d')!;
-
-	context.fillStyle = '#f42020';
-	context.beginPath();
-	context.ellipse(canvas.width - markerSize, markerSize, markerSize, markerSize, 0, 0, 2 * Math.PI);
-	context.closePath();
-	context.fill();
-
-	element.setAttribute(icon.unread, canvas.toDataURL());
-}
-
-async function discoverIcons(element: HTMLElement): Promise<void> {
-	if (element) {
-		return createIcons(element, element.getAttribute('src')!);
-	}
-
-	console.warn('Could not discover profile picture. Falling back to default image.');
-
-	// Fall back to messenger favicon
-	const messengerIcon = document.querySelector('link[rel~="icon"]');
-
-	if (messengerIcon) {
-		return createIcons(element, messengerIcon.getAttribute('href')!);
-	}
-
-	// Fall back to facebook favicon
-	return createIcons(element, 'https://facebook.com/favicon.ico');
-}
-
-async function getIcon(element: HTMLElement, unread: boolean): Promise<string> {
-	if (element === null) {
-		return icon.read;
-	}
-
-	if (!element.getAttribute(icon.read)) {
-		await discoverIcons(element);
-	}
-
-	return element.getAttribute(unread ? icon.unread : icon.read)!;
-}
-
-async function getLabel(element: HTMLElement): Promise<string> {
-	if (isNull(element)) {
+function getText(element: Element | undefined): string {
+	if (!element) {
 		return '';
 	}
 
-	const emojis: HTMLElement[] = [];
-	if (element !== null) {
-		for (const elementCurrent of element.children) {
-			emojis.push(elementCurrent as HTMLElement);
+	const clone = element.cloneNode(true) as Element;
+	for (const image of clone.querySelectorAll('img')) {
+		const alt = image.alt.toLowerCase() === '(y)' ? '👍' : image.alt;
+		image.replaceWith(alt);
+	}
+
+	return clone.textContent?.trim() ?? '';
+}
+
+function isUnreadConversation(link: HTMLAnchorElement): boolean {
+	if (link.querySelector('[aria-label="Mark as Read" i]')) {
+		return true;
+	}
+
+	// The unread status is a visually hidden label inside a span wrapper.
+	for (const label of link.querySelectorAll<HTMLElement>('.html-span > :is(div, span)')) {
+		if (label.childElementCount > 0 || !label.textContent?.trim()) {
+			continue;
+		}
+
+		const style = window.getComputedStyle(label);
+		if (style.position === 'absolute' && style.width === '1px' && style.height === '1px' && style.overflow === 'hidden') {
+			return true;
 		}
 	}
 
-	for (const emoji of emojis) {
-		emoji.outerHTML = emoji.querySelector('img')?.getAttribute('alt') ?? '';
+	return false;
+}
+
+function getAvatar(link: HTMLAnchorElement): string {
+	const avatar = link.querySelector('img, svg image');
+	if (avatar instanceof HTMLImageElement) {
+		return avatar.currentSrc || avatar.src;
 	}
 
-	return element.textContent ?? '';
+	return avatar?.getAttribute('href') ?? avatar?.getAttribute('xlink:href') ?? '';
 }
 
-async function createConversationNewDesign(element: HTMLElement): Promise<Conversation> {
-	const conversation: Partial<Conversation> = {};
-	// TODO: Exclude muted conversations
-	/*
-	const muted = Boolean(element.querySelector(selectors.muteIconNewDesign));
-	*/
+function getConversationRows(): ConversationRow[] {
+	return getConversationLinks().flatMap(link => {
+		const url = getConversationUrl(link);
+		if (!url) {
+			return [];
+		}
 
-	conversation.selected = Boolean(element.querySelector('[role=row] [role=link] > div:only-child'));
-	conversation.unread = Boolean(element.querySelector('[aria-label="Mark as Read"]'));
+		const textNodes = [...link.querySelectorAll(`${selectors.conversationLabel}, ${selectors.conversationPreview}`)];
+		const title = getText(textNodes[0]);
+		const preview = textNodes.find(element => element !== textNodes[0] && element.matches(selectors.conversationPreview));
+		const row = link.closest('[role=row]');
 
-	const unparsedLabel = element.querySelector<HTMLElement>('.a8c37x1j.ni8dbmo4.stjgntxs.l9j0dhe7 > span > span')!;
-	conversation.label = await getLabel(unparsedLabel);
-
-	const iconElement = element.querySelector<HTMLElement>('img')!;
-	conversation.icon = await getIcon(iconElement, conversation.unread);
-
-	return conversation as Conversation;
+		return [{
+			url,
+			title: title.length > 0 ? title : (link.getAttribute('aria-label') ?? ''),
+			body: getText(preview),
+			avatar: getAvatar(link),
+			unread: isUnreadConversation(link),
+			muted: Boolean(row?.querySelector(selectors.mutedConversation)),
+			selected: link.getAttribute('aria-current') === 'page',
+		}];
+	});
 }
 
-async function createConversationList(): Promise<Conversation[]> {
-	const conversationListSelector = selectors.conversationList;
+async function loadAvatar(url: string): Promise<HTMLImageElement | undefined> {
+	if (!URL.canParse(url) || new URL(url).protocol !== 'https:') {
+		return undefined;
+	}
 
-	const list = await elementReady(conversationListSelector, {
-		stopOnDomReady: false,
+	return new Promise(resolve => {
+		const image = new Image();
+		image.crossOrigin = 'anonymous';
+
+		const timer = setTimeout(resolve, imageTimeout);
+		image.addEventListener('load', () => {
+			clearTimeout(timer);
+			resolve(image);
+		}, {once: true});
+		image.addEventListener('error', () => {
+			clearTimeout(timer);
+			resolve(undefined);
+		}, {once: true});
+
+		image.src = url;
+	});
+}
+
+async function createIcon(url: string, unread: boolean): Promise<string> {
+	const image = await loadAvatar(url);
+	if (!image) {
+		return '';
+	}
+
+	const canvas = document.createElement('canvas');
+	canvas.width = 50;
+	canvas.height = 56;
+	const context = canvas.getContext('2d');
+	if (!context) {
+		return '';
+	}
+
+	context.save();
+	context.beginPath();
+	context.arc(25, 28, 25, 0, Math.PI * 2);
+	context.clip();
+	context.drawImage(image, 0, 3, 50, 50);
+	context.restore();
+
+	if (unread) {
+		context.fillStyle = '#f42020';
+		context.beginPath();
+		context.arc(42, 8, 8, 0, 2 * Math.PI);
+		context.fill();
+	}
+
+	return canvas.toDataURL();
+}
+
+const readIcons = new Map<string, Promise<string>>();
+const unreadIcons = new Map<string, Promise<string>>();
+
+async function getIcon(avatar: string, unread: boolean): Promise<string> {
+	if (!avatar) {
+		return '';
+	}
+
+	const cache = unread ? unreadIcons : readIcons;
+	const cached = cache.get(avatar);
+	if (cached) {
+		return cached;
+	}
+
+	// Limit memory use across long sessions even when profile URLs rotate.
+	if (cache.size >= 100) {
+		const oldest = cache.keys().next().value;
+		if (oldest) {
+			cache.delete(oldest);
+		}
+	}
+
+	const pending = createIcon(avatar, unread).catch(() => '');
+	cache.set(avatar, pending);
+	return pending;
+}
+
+export async function sendConversationList(rows = getConversationRows()): Promise<void> {
+	if (!isMessagesUrl(location.href)) {
+		return;
+	}
+
+	const version = ++updateVersion;
+	const visibleRows = document.documentElement.classList.contains('private-mode') ? [] : rows;
+	const conversations = await Promise.all(visibleRows.map(async row => ({
+		label: row.title || 'Conversation',
+		selected: row.selected,
+		unread: row.unread,
+		icon: await getIcon(row.avatar, row.unread),
+	})));
+
+	if (version === updateVersion && isMessagesUrl(location.href)) {
+		await callMain('conversations', conversations);
+	}
+}
+
+function notificationId(url: string): number {
+	let hash = 0;
+	for (const character of url) {
+		hash = ((hash * 31) + character.codePointAt(0)!) % 2_147_483_647;
+	}
+
+	return -(hash + 1);
+}
+
+function isChatListPage(): boolean {
+	return isMessagesUrl(location.href)
+		&& (/^\/messages(?:\/new)?\/?$/.test(location.pathname) || isMessagesThreadUrl(location.href));
+}
+
+async function notify(row: ConversationRow, isCurrent: () => boolean): Promise<void> {
+	const icon = await getIcon(row.avatar, false);
+	if (isChatListPage() && isCurrent()) {
+		await callMain('notification', {
+			id: notificationId(row.url),
+			title: row.title,
+			body: row.body,
+			icon,
+			silent: false,
+			conversationUrl: row.url,
+		});
+	}
+}
+
+export function observeConversationList(): void {
+	let grid: Element | undefined;
+	let previousRows = new Map<string, ConversationRow>();
+	let previousCount: number | undefined;
+	let pending = false;
+
+	function refresh(initial: boolean): void {
+		if (!grid?.isConnected || !isMessagesUrl(location.href)) {
+			return;
+		}
+
+		const rows = getConversationRows();
+		const oldRows = previousRows;
+		previousRows = new Map(rows.map(row => [row.url, row]));
+
+		if (process.platform === 'darwin') {
+			void sendConversationList(rows);
+		}
+
+		if (!isChatListPage()) {
+			return;
+		}
+
+		const unreadRows = rows.filter(row => row.unread && !row.muted);
+		if (unreadRows.length !== previousCount) {
+			previousCount = unreadRows.length;
+			void callMain('update-tray-icon', previousCount);
+		}
+
+		if (initial || document.hasFocus()) {
+			return;
+		}
+
+		for (const row of unreadRows) {
+			const previous = oldRows.get(row.url);
+			if (row.title && (!previous?.unread || (previous.body && previous.body !== row.body))) {
+				void notify(row, () => {
+					const latest = previousRows.get(row.url);
+					return Boolean(latest?.unread && !latest.muted && latest.body === row.body);
+				});
+			}
+		}
+	}
+
+	const gridObserver = new MutationObserver(() => {
+		if (!pending) {
+			pending = true;
+			setTimeout(() => {
+				pending = false;
+				refresh(false);
+			}, rowUpdateDelay);
+		}
 	});
 
-	if (!list) {
-		console.error('Could not find conversation list', conversationListSelector);
-		return [];
-	}
-
-	const elements: HTMLElement[] = [...list.children] as HTMLElement[];
-
-	// Remove last element from childer list
-	elements.splice(-1, 1);
-
-	const conversations: Conversation[] = await Promise.all(elements.map(async element => createConversationNewDesign(element)));
-
-	return conversations;
-}
-
-export async function sendConversationList(): Promise<void> {
-	const conversationsToRender: Conversation[] = await createConversationList();
-	ipc.callMain('conversations', conversationsToRender);
-}
-
-function generateStringFromNode(element: Element): string | undefined {
-	const cloneElement = element.cloneNode(true) as Element;
-	let emojiString;
-
-	const images = cloneElement.querySelectorAll('img');
-	for (const image of images) {
-		emojiString = image.alt;
-		// Replace facebook's thumbs up with emoji
-		if (emojiString === '(Y)' || emojiString === '(y)') {
-			emojiString = '👍';
+	function attachToGrid(): void {
+		const nextGrid = isMessagesUrl(location.href) ? (document.querySelector(selectors.conversationList) ?? undefined) : undefined;
+		if (nextGrid === grid) {
+			return;
 		}
 
-		image.parentElement?.replaceWith(document.createTextNode(emojiString));
-	}
+		gridObserver.disconnect();
+		grid = nextGrid;
 
-	return cloneElement.textContent ?? undefined;
-}
-
-function countUnread(mutationsList: MutationRecord[]): void {
-	const alreadyChecked: string[] = [];
-
-	const unreadMutations = mutationsList.filter(mutation =>
-		// When a conversations "becomes unread".
-		(
-			mutation.type === 'childList'
-			&& mutation.addedNodes.length > 0
-			&& ((mutation.addedNodes[0] as Element).className === selectors.conversationSidebarUnreadDot)
-		)
-		// When text is received
-		|| (
-			mutation.type === 'characterData'
-			// Make sure the text corresponds to a conversation
-			&& mutation.target.parentElement?.parentElement?.parentElement?.className === selectors.conversationSidebarTextParent
-		)
-		// When an emoji is received, node(s) are added
-		|| (
-			mutation.type === 'childList'
-			// Make sure the mutation corresponds to a conversation
-			&& mutation.target.parentElement?.parentElement?.className === selectors.conversationSidebarTextParent
-		)
-		// Emoji change
-		|| (
-			mutation.type === 'attributes'
-			&& mutation.target.parentElement?.parentElement?.parentElement?.parentElement?.className === selectors.conversationSidebarTextParent
-		));
-
-	// Check latest mutation first
-	for (const mutation of unreadMutations.reverse()) {
-		const current = (mutation.target.parentElement as Element).closest(selectors.conversationSidebarSelector)!;
-
-		const href = current.closest('[role="link"]')?.getAttribute('href');
-
-		if (!href) {
-			continue;
-		}
-
-		// It is possible to have multiple mutations for the same conversation, but we only want one notification.
-		// So if the current conversation has already been checked, continue.
-		// Additionally if the conversation is not unread, then also continue.
-		if (alreadyChecked.includes(href) || !current.querySelector('.' + selectors.conversationSidebarUnreadDot.replaceAll(/ /, '.'))) {
-			continue;
-		}
-
-		alreadyChecked.push(href);
-
-		// Get the image data URI from the parent of the author/text
-		const imgUrl = current.querySelector('img')?.dataset.caprineIcon;
-		const textOptions = current.querySelectorAll(selectors.conversationSidebarTextSelector);
-		// Get the author and text of the new message
-		const titleTextNode = textOptions[0];
-		const bodyTextNode = textOptions[1];
-
-		const titleText = generateStringFromNode(titleTextNode);
-		const bodyText = generateStringFromNode(bodyTextNode);
-
-		if (!bodyText || !titleText || !imgUrl) {
-			continue;
-		}
-
-		// Send a notification
-		ipc.callMain('notification', {
-			id: 0,
-			title: titleText,
-			body: bodyText,
-			icon: imgUrl,
-			silent: false,
-		});
-	}
-}
-
-async function updateTrayIcon(): Promise<void> {
-	let messageCount = 0;
-
-	await elementReady(selectors.chatsIcon, {stopOnDomReady: false});
-
-	// Count unread messages in Chats, Marketplace, etc.
-	for (const element of document.querySelectorAll<HTMLElement>(selectors.chatsIcon)) {
-		// Extract messageNumber from ariaLabel
-		const messageNumber = element?.ariaLabel?.match(/\d+/g);
-
-		if (messageNumber) {
-			messageCount += Number.parseInt(messageNumber[0], 10);
+		if (grid) {
+			gridObserver.observe(grid, {
+				subtree: true,
+				childList: true,
+				characterData: true,
+				attributes: true,
+				attributeFilter: ['alt', 'aria-current', 'aria-label', 'class', 'href', 'src', 'style'],
+			});
+			refresh(true);
 		}
 	}
 
-	ipc.callMain('update-tray-icon', messageCount);
+	const layoutObserver = new MutationObserver(attachToGrid);
+	layoutObserver.observe(document.body, {childList: true, subtree: true});
+	attachToGrid();
 }
-
-window.addEventListener('load', async () => {
-	const sidebar = await elementReady('[role=navigation]:has([role=grid])', {stopOnDomReady: false});
-	const leftSidebar = await elementReady(`${selectors.leftSidebar}:has(${selectors.chatsIcon})`, {stopOnDomReady: false});
-
-	if (sidebar) {
-		const conversationListObserver = new MutationObserver(async () => sendConversationList());
-		const conversationCountObserver = new MutationObserver(countUnread);
-
-		conversationListObserver.observe(sidebar, {
-			subtree: true,
-			childList: true,
-			attributes: true,
-			attributeFilter: ['class'],
-		});
-
-		conversationCountObserver.observe(sidebar, {
-			characterData: true,
-			subtree: true,
-			childList: true,
-			attributes: true,
-			attributeFilter: ['src', 'alt'],
-		});
-	}
-
-	if (leftSidebar) {
-		const chatsIconObserver = new MutationObserver(async () => updateTrayIcon());
-
-		chatsIconObserver.observe(leftSidebar, {
-			subtree: true,
-			childList: true,
-			attributes: true,
-			attributeFilter: ['aria-label'],
-		});
-	}
-});

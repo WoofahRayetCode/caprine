@@ -30,7 +30,6 @@
 
 - [Dark theme](#dark-mode)
 - [Vibrant theme](#vibrancy-macos-only)\*
-- [Privacy-focused](#privacy)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Menu bar mode](#menu-bar-mode-macos-only-)\*
 - [Work Chat support](#work-chat-support)
@@ -47,7 +46,7 @@
 
 ## Install
 
-*macOS 10.12+ (Intel and Apple Silicon), Linux (x64 and arm64), and Windows 10+ (64-bit) are supported.*
+*Caprine requires macOS 13+ (Intel or Apple Silicon), Linux (x64 or arm64), or Windows 10+ (64-bit).*
 
 Download the latest version on the [website](https://github.com/sindresorhus/caprine) or below.
 
@@ -249,11 +248,9 @@ On *macOS*, you can toggle the window vibrancy effect in the `View` menu.
 
 ### Privacy
 
-<img src="media/screenshot-block-typing-indicator.png" width="626">
+The legacy typing, seen, and delivery-receipt filters are unavailable on Facebook Messages.
 
-You can choose to prevent people from knowing when you have seen a message and when you are currently typing. These settings are available under the `Caprine`/`File` menu.
-
-### Mute desktop notifications *(macOS only)*
+### Mute desktop notifications
 
 You can quickly disable receiving notifications from the `Caprine`/`File` menu or the Dock on macOS.
 
@@ -291,9 +288,9 @@ Desktop notifications can be turned on in `Preferences`.
 
 You can toggle whether Caprine stays on top of other windows in the `Window`/`View` menu or with <kbd>Command/Control</kbd> <kbd>Shift</kbd> <kbd>t</kbd>.
 
-### Work Chat support
+### Signing in
 
-Support for Work Chat: Messenger for [Workplace](https://www.facebook.com/workplace). You can switch to it in the `Caprine`/`File` menu.
+Caprine opens [Facebook Messages](https://www.facebook.com/messages/) and uses Facebook’s sign-in and account recovery pages. Existing Caprine users may need to sign in again after the move from Messenger.com. If Facebook asks for a PIN to restore encrypted chat history, follow the steps shown by Facebook.
 
 <div align="center"><img src="media/screenshot-work-chat.png" width="788"></div>
 

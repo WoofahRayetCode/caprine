@@ -56,9 +56,9 @@ export default {
 						config.set('showDockIcon', menuItem.checked);
 
 						if (menuItem.checked) {
-							app.dock.show();
+							app.dock?.show();
 						} else {
-							app.dock.hide();
+							app.dock?.hide();
 						}
 
 						const dockMenuItem = contextMenu.getMenuItemById('dockMenu')!;
@@ -128,14 +128,6 @@ export default {
 		previousMessageCount = messageCount;
 		tray.setImage(getIconPath(messageCount > 0));
 		updateToolTip(messageCount);
-	},
-
-	setBadge(shouldDisplayUnread: boolean) {
-		if (is.macos || !tray) {
-			return;
-		}
-
-		tray.setImage(getIconPath(shouldDisplayUnread));
 	},
 };
 

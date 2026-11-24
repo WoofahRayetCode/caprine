@@ -1,445 +1,379 @@
-import process from 'node:process';
+/* eslint-disable n/prefer-global/process -- Electron supplies process to sandboxed preloads. */
 import {ipcRenderer as ipc} from 'electron-better-ipc';
-import {is} from 'electron-util';
-import elementReady from 'element-ready';
-import {nativeTheme} from '@electron/remote';
-import selectors from './browser/selectors';
+import selectors, {getConversationLinks, getConversationUrl} from './browser/selectors';
 import {toggleVideoAutoplay} from './autoplay';
-import {sendConversationList} from './browser/conversation-list';
+import {observeConversationList, sendConversationList} from './browser/conversation-list';
+import {
+	classifyUrl, externalUrl, isMessagesThreadUrl, isMessagesUrl, messagesUrl,
+} from './navigation';
+import {callMain} from './renderer-ipc';
 import {IToggleSounds} from './types';
 
-async function withMenu(
-	menuButtonElement: HTMLElement,
-	callback: () => Promise<void> | void,
-): Promise<void> {
-	const {classList} = document.documentElement;
+const isMac = process.platform === 'darwin';
+const isLinux = process.platform === 'linux';
+const waitTimeout = 2000;
+const waitInterval = 50;
 
-	// Prevent the dropdown menu from displaying
-	classList.add('hide-dropdowns');
-
-	// Click the menu button
-	menuButtonElement.click();
-
-	// Wait for the menu to close before removing the 'hide-dropdowns' class
-	await elementReady('.x78zum5.xdt5ytf.x1n2onr6.xat3117.xxzkxad > div:nth-child(2) > div', {stopOnDomReady: false});
-	const menuLayer = document.querySelector('.x78zum5.xdt5ytf.x1n2onr6.xat3117.xxzkxad > div:nth-child(2) > div');
-
-	if (menuLayer) {
-		const observer = new MutationObserver(() => {
-			if (!menuLayer.hasChildNodes()) {
-				classList.remove('hide-dropdowns');
-				observer.disconnect();
-			}
-		});
-		observer.observe(menuLayer, {childList: true});
-	} else {
-		// Fallback in case .uiContextualLayerPositioner is missing
-		classList.remove('hide-dropdowns');
-	}
-
-	await callback();
+function isMessagesPage(): boolean {
+	return window.top === window && isMessagesUrl(location.href);
 }
 
-async function isNewSidebar(): Promise<boolean> {
-	// TODO: stopOnDomReady might not be needed
-	await elementReady(selectors.leftSidebar, {stopOnDomReady: false});
-
-	const sidebars = document.querySelectorAll<HTMLElement>(selectors.leftSidebar);
-
-	return sidebars.length === 2;
-}
-
-async function withSettingsMenu(callback: () => Promise<void> | void): Promise<void> {
-	// Wait for navigation pane buttons to show up
-	const settingsMenu = await elementReady(selectors.userMenuNewSidebar, {stopOnDomReady: false});
-
-	await withMenu(settingsMenu as HTMLElement, callback);
-}
-
-async function selectMenuItem(itemNumber: number): Promise<void> {
-	let selector;
-
-	// Wait for menu to show up
-	await elementReady(selectors.conversationMenuSelectorNewDesign, {stopOnDomReady: false});
-
-	const items = document.querySelectorAll<HTMLElement>(
-		`${selectors.conversationMenuSelectorNewDesign} [role=menuitem]`,
-	);
-
-	// Negative items will select from the end
-	if (itemNumber < 0) {
-		selector = -itemNumber <= items.length ? items[items.length + itemNumber] : null;
-	} else {
-		selector = itemNumber <= items.length ? items[itemNumber - 1] : null;
-	}
-
-	if (selector) {
-		selector.click();
-	}
-}
-
-async function selectOtherListViews(itemNumber: number): Promise<void> {
-	// In case one of other views is shown
-	clickBackButton();
-
-	const newSidebar = await isNewSidebar();
-
-	if (newSidebar) {
-		const items = document.querySelectorAll<HTMLElement>(
-			`${selectors.viewsMenu} span > a`,
-		);
-
-		const selector = itemNumber <= items.length ? items[itemNumber - 1] : null;
-
-		if (selector) {
-			selector.click();
+function answerInMessages<Data, Result>(channel: string, handler: (data: Data) => Result): void {
+	ipc.answerMain(channel, (data: Data) => {
+		if (isMessagesPage()) {
+			return handler(data);
 		}
-	} else {
-		await withSettingsMenu(() => {
-			selectMenuItem(itemNumber);
-		});
-	}
+
+		return undefined;
+	});
 }
 
-function clickBackButton(): void {
-	const backButton = document.querySelector<HTMLElement>('._30yy._2oc9');
-
-	if (backButton) {
-		backButton.click();
+async function waitFor<T>(find: () => T | undefined): Promise<T | undefined> {
+	if (!isMessagesPage()) {
+		return undefined;
 	}
+
+	const immediate = find();
+	if (immediate) {
+		return immediate;
+	}
+
+	return new Promise(resolve => {
+		const timer = setInterval(() => {
+			const onMessages = isMessagesPage();
+			const found = onMessages ? find() : undefined;
+			if (found !== undefined || !onMessages) {
+				clearInterval(timer);
+				clearTimeout(deadline);
+				resolve(found);
+			}
+		}, waitInterval);
+		const deadline = setTimeout(() => {
+			clearInterval(timer);
+			resolve(undefined);
+		}, waitTimeout);
+	});
 }
 
-ipc.answerMain('show-preferences', async () => {
-	if (isPreferencesOpen()) {
-		return;
-	}
-
-	await openPreferences();
-});
-
-ipc.answerMain('new-conversation', async () => {
-	document.querySelector<HTMLElement>('[href="/new/"]')!.click();
-});
-
-ipc.answerMain('new-room', async () => {
-	document.querySelector<HTMLElement>('.x16n37ib .x1i10hfl.x6umtig.x1b1mbwd.xaqea5y.xav7gou.x1ypdohk.xe8uvvx.xdj266r.x11i5rnm.xat24cr.x1mh8g0r.x16tdsg8.x1hl2dhg.xggy1nq.x87ps6o.x1lku1pv.x1a2a7pz.x6s0dn4.x14yjl9h.xudhj91.x18nykt9.xww2gxu.x972fbf.xcfux6l.x1qhh985.xm0m39n.x9f619.x78zum5.xl56j7k.xexx8yu.x4uap5.x18d9i69.xkhd6sd.x1n2onr6.xc9qbxq.x14qfxbe.x1qhmfi1')!.click();
-});
-
-ipc.answerMain('log-out', async () => {
-	const useWorkChat = await ipc.callMain<undefined, boolean>('get-config-useWorkChat');
-	if (useWorkChat) {
-		document.querySelector<HTMLElement>('._5lxs._3qct._p')!.click();
-
-		// Menu creation is slow
-		setTimeout(() => {
-			const nodes = document.querySelectorAll<HTMLElement>(
-				'._54nq._9jo._558b._2n_z li:last-child a',
-			);
-
-			nodes[nodes.length - 1].click();
-		}, 250);
-	} else {
-		await withSettingsMenu(() => {
-			selectMenuItem(-1);
-		});
-	}
-});
-
-ipc.answerMain('find', () => {
-	document.querySelector<HTMLElement>('[type="search"]')!.focus();
-});
-
-async function openSearchInConversation() {
-	const mainView = document.querySelector('.x9f619.x1ja2u2z.x78zum5.x1n2onr6.x1r8uery.x1iyjqo2.xs83m0k.xeuugli.x1qughib.x1qjc9v5.xozqiw3.x1q0g3np.xexx8yu.x85a59c')!;
-	const rightSidebarIsClosed = Boolean(mainView.querySelector<HTMLElement>(':scope > div:only-child'));
-
-	if (rightSidebarIsClosed) {
-		document.querySelector<HTMLElement>(selectors.rightSidebarMenu)?.click();
-	}
-
-	await elementReady(selectors.rightSidebarButtons, {stopOnDomReady: false});
-	const buttonList = document.querySelectorAll<HTMLElement>(selectors.rightSidebarButtons);
-
-	// Search in conversation is the last button
-	buttonList[buttonList.length - 1].click();
+function query(selector: string, root: ParentNode = document): HTMLElement | undefined {
+	return root.querySelector<HTMLElement>(selector) ?? undefined;
 }
 
-ipc.answerMain('search', () => {
-	openSearchInConversation();
-});
-
-ipc.answerMain('insert-gif', () => {
-	document.querySelector<HTMLElement>('.x1n2onr6.x1iyjqo2.xw2csxc > div:nth-child(3) > span > div')!.click();
-});
-
-ipc.answerMain('insert-emoji', async () => {
-	document.querySelector<HTMLElement>('.x1n2onr6.x1iyjqo2.xw2csxc > div:nth-child(5) > span > div')!.click();
-});
-
-ipc.answerMain('insert-sticker', () => {
-	document.querySelector<HTMLElement>('.x1n2onr6.x1iyjqo2.xw2csxc > div:nth-child(2) > span > div')!.click();
-});
-
-ipc.answerMain('attach-files', () => {
-	document.querySelector<HTMLElement>('.x1n2onr6.x1iyjqo2.xw2csxc > div:nth-child(1) > span > div')!.click();
-});
-
-ipc.answerMain('focus-text-input', () => {
-	document.querySelector<HTMLElement>('[role=textbox][contenteditable=true]')!.focus();
-});
-
-ipc.answerMain('next-conversation', nextConversation);
-
-ipc.answerMain('previous-conversation', previousConversation);
-
-ipc.answerMain('mute-conversation', async () => {
-	await openMuteModal();
-});
-
-ipc.answerMain('delete-conversation', async () => {
-	const index = selectedConversationIndex();
-
-	if (index !== -1) {
-		await deleteSelectedConversation();
-
-		const key = index + 1;
-		await jumpToConversation(key);
-	}
-});
-
-ipc.answerMain('archive-conversation', async () => {
-	const index = selectedConversationIndex();
-
-	if (index !== -1) {
-		await archiveSelectedConversation();
-
-		const key = index + 1;
-		await jumpToConversation(key);
-	}
-});
-
-async function openHiddenPreferences(): Promise<boolean> {
-	if (!isPreferencesOpen()) {
-		document.documentElement.classList.add('hide-preferences-window');
-
-		await openPreferences();
-
-		return true;
-	}
-
-	return false;
+function queryConversationNavigation(): HTMLElement | undefined {
+	return query(selectors.conversationNavigation);
 }
 
-async function toggleSounds({checked}: IToggleSounds): Promise<void> {
-	const shouldClosePreferences = await openHiddenPreferences();
-
-	const soundsCheckbox = document.querySelector<HTMLInputElement>(`${selectors.preferencesSelector} ${selectors.messengerSoundsSelector}`)!;
-	if (checked === undefined || checked !== soundsCheckbox.checked) {
-		soundsCheckbox.click();
-	}
-
-	if (shouldClosePreferences) {
-		await closePreferences();
-	}
+function accessibleName(element: HTMLElement): string {
+	return (element.getAttribute('aria-label') ?? element.textContent ?? '').trim();
 }
 
-ipc.answerMain('toggle-sounds', toggleSounds);
-
-ipc.answerMain('toggle-mute-notifications', async () => {
-	const shouldClosePreferences = await openHiddenPreferences();
-
-	const notificationCheckbox = document.querySelector<HTMLInputElement>(
-		selectors.notificationCheckbox,
-	)!;
-
-	if (shouldClosePreferences) {
-		await closePreferences();
-	}
-
-	// TODO: Fix notifications
-	if (notificationCheckbox === null) {
+async function selectFromMenu(button: HTMLElement | undefined, findItem: (items: HTMLElement[]) => HTMLElement | undefined): Promise<boolean> {
+	if (!button) {
 		return false;
 	}
 
-	return !notificationCheckbox.checked;
-});
+	const getItems = () => [...document.querySelectorAll<HTMLElement>(selectors.menuItem)];
+	const oldItems = button.getAttribute('aria-expanded') === 'true' ? [] : getItems();
 
-ipc.answerMain('toggle-message-buttons', async () => {
-	const showMessageButtons = await ipc.callMain<undefined, boolean>('get-config-showMessageButtons');
-	document.body.classList.toggle('show-message-buttons', !showMessageButtons);
-});
+	if (button.getAttribute('aria-expanded') !== 'true') {
+		button.click();
+	}
 
-ipc.answerMain('show-chats-view', async () => {
-	await selectOtherListViews(1);
-});
+	const item = await waitFor(() => findItem(getItems().filter(item => !oldItems.includes(item))));
+	item?.click();
+	return Boolean(item);
+}
 
-ipc.answerMain('show-marketplace-view', async () => {
-	await selectOtherListViews(2);
-});
+function findMenuItem(items: HTMLElement[], path: string, label: string): HTMLElement | undefined {
+	return items.find(item => accessibleName(item) === label || item.querySelector(`path[d^="${path}"]`));
+}
 
-ipc.answerMain('show-requests-view', async () => {
-	await selectOtherListViews(3);
-});
+async function selectSettingsItem(path: string, label: string): Promise<boolean> {
+	const navigation = queryConversationNavigation();
+	const button = navigation && query(selectors.settingsMenu, navigation);
+	return selectFromMenu(button, items => findMenuItem(items, path, label));
+}
 
-ipc.answerMain('show-archive-view', async () => {
-	await selectOtherListViews(4);
-});
+async function openPreferences(): Promise<HTMLElement | undefined> {
+	const dialog = query(selectors.preferencesDialog);
+	if (dialog) {
+		return dialog;
+	}
 
-ipc.answerMain('toggle-video-autoplay', () => {
-	toggleVideoAutoplay();
-});
+	if (await selectSettingsItem('M10 5.75', 'Preferences')) {
+		return waitFor(() => query(selectors.preferencesDialog));
+	}
 
+	return undefined;
+}
+
+async function toggleSounds({checked}: IToggleSounds): Promise<void> {
+	const root = document.documentElement;
+	const existingDialog = query(selectors.preferencesDialog);
+	if (!existingDialog) {
+		root.classList.add('hide-preferences-window');
+	}
+
+	try {
+		const dialog = existingDialog ?? await openPreferences();
+		if (!dialog || !isMessagesPage()) {
+			return;
+		}
+
+		// Facebook places the notification sounds switch first in Messenger Preferences.
+		const soundSwitch = query('[role=switch]', dialog);
+		const setting = soundSwitch?.getAttribute('aria-checked');
+		if ((setting === 'true' || setting === 'false') && (checked === undefined || checked !== (setting === 'true'))) {
+			soundSwitch?.click();
+		}
+
+		if (!existingDialog) {
+			query('[aria-label=Close], [role=button][aria-label=Back]', dialog)?.click();
+		}
+	} finally {
+		root.classList.remove('hide-preferences-window');
+	}
+}
+
+async function logOut(): Promise<void> {
+	const root = document.documentElement;
+	root.classList.add('caprine-account-menu');
+	let selectedLogout = false;
+
+	try {
+		const buttons = document.querySelectorAll<HTMLElement>(selectors.profileButton);
+		const button = buttons[buttons.length - 1];
+		if (!button) {
+			return;
+		}
+
+		const expanded = button.getAttribute('aria-expanded') === 'true';
+		const previousDialogs = expanded ? [] : [...document.querySelectorAll('[role=dialog]')];
+		if (!expanded) {
+			button.click();
+		}
+
+		const action = await waitFor(() => {
+			const items = document.querySelectorAll<HTMLElement>('[role=dialog] :is(a[href], button, [role=button], [role=menuitem])');
+			return [...items].find(item => {
+				const dialog = item.closest('[role=dialog]');
+				if (dialog && previousDialogs.includes(dialog)) {
+					return false;
+				}
+
+				const href = item.getAttribute('href');
+				if (href && URL.canParse(href, location.href)) {
+					const url = new URL(href, location.href);
+					if (classifyUrl(url.href) === 'account' && /^\/logout(?:\.php)?\/?$/.test(url.pathname)) {
+						return true;
+					}
+				}
+
+				return accessibleName(item) === 'Log out';
+			});
+		});
+
+		if (action) {
+			selectedLogout = true;
+			action.click();
+		}
+	} finally {
+		// Keep the native menu visible if its logout control could not be identified.
+		if (selectedLogout || !isMessagesPage()) {
+			root.classList.remove('caprine-account-menu');
+		}
+	}
+}
+
+async function searchInConversation(): Promise<void> {
+	const search = query(selectors.searchInConversation);
+	if (search) {
+		search.click();
+		return;
+	}
+
+	const info = query(selectors.conversationInfo);
+	if (info?.getAttribute('aria-expanded') !== 'true') {
+		info?.click();
+	}
+
+	const searchButton = await waitFor(() => query(selectors.searchInConversation));
+	searchButton?.click();
+}
+
+type ConversationAction = 'mute' | 'archive' | 'delete';
+
+async function actOnConversation(action: ConversationAction): Promise<void> {
+	const conversation = getConversationLinks().find(link => link.getAttribute('aria-current') === 'page');
+	const row = conversation?.closest('[role=row]');
+	if (!row) {
+		return;
+	}
+
+	const menuButton = query('[role=button][aria-haspopup=menu], [role=button][aria-label=Menu]', row)
+		?? [...row.querySelectorAll<HTMLElement>('[role=button]')].find(button => button.parentElement?.classList.contains('html-div'));
+
+	await selectFromMenu(menuButton, items => {
+		if (action === 'mute') {
+			return findMenuItem(items, 'M109.362 211', 'Mute notifications');
+		}
+
+		if (action === 'delete') {
+			return findMenuItem(items, 'M8.75', 'Delete chat');
+		}
+
+		return items.find(item => ['Archive chat', 'Archive'].includes(accessibleName(item)));
+	});
+}
+
+function selectConversation(index: number): void {
+	getConversationLinks()[index]?.click();
+}
+
+function stepConversation(offset: number): void {
+	const links = getConversationLinks();
+	const index = links.findIndex(link => link.getAttribute('aria-current') === 'page');
+	if (index >= 0) {
+		links[(index + offset + links.length) % links.length].click();
+	}
+}
+
+answerInMessages('show-preferences', async () => {
+	await openPreferences();
+});
+answerInMessages('new-conversation', () => {
+	const navigation = queryConversationNavigation();
+	if (navigation) {
+		query(selectors.newConversation, navigation)?.click();
+	}
+});
+answerInMessages('log-out', logOut);
+answerInMessages('find', () => {
+	const navigation = queryConversationNavigation();
+	if (navigation) {
+		query(selectors.conversationSearch, navigation)?.focus();
+	}
+});
+answerInMessages('search', searchInConversation);
+answerInMessages('insert-gif', () => query(selectors.gif)?.click());
+answerInMessages('insert-emoji', () => query(selectors.emoji)?.click());
+answerInMessages('insert-sticker', () => query(selectors.sticker)?.click());
+answerInMessages('attach-files', () => query(selectors.attachment)?.click());
+answerInMessages('focus-text-input', () => query(selectors.composer)?.focus());
+answerInMessages('next-conversation', () => {
+	stepConversation(1);
+});
+answerInMessages('previous-conversation', () => {
+	stepConversation(-1);
+});
+answerInMessages('jump-to-conversation', (key: number) => {
+	if (Number.isSafeInteger(key) && key >= 1) {
+		selectConversation(key - 1);
+	}
+});
+answerInMessages('mute-conversation', async () => actOnConversation('mute'));
+answerInMessages('archive-conversation', async () => actOnConversation('archive'));
+answerInMessages('delete-conversation', async () => actOnConversation('delete'));
+answerInMessages('toggle-sounds', toggleSounds);
+answerInMessages('show-chats-view', () => {
+	if (location.href !== messagesUrl) {
+		location.assign(messagesUrl);
+	}
+});
+answerInMessages('show-requests-view', async () => selectSettingsItem('M95.5 219.208', 'Message requests'));
+answerInMessages('show-archive-view', async () => selectSettingsItem('M109.5 207.75', 'Archived chats'));
+answerInMessages('toggle-video-autoplay', toggleVideoAutoplay);
 ipc.answerMain('reload', () => {
 	location.reload();
 });
 
+type ThemeSource = 'light' | 'dark' | 'system';
+let useDarkColors: boolean | undefined;
+
+function applyTheme(): void {
+	if (!isMessagesPage() || useDarkColors === undefined) {
+		return;
+	}
+
+	const {classList} = document.documentElement;
+	classList.toggle('dark-mode', useDarkColors);
+	classList.toggle('light-mode', !useDarkColors);
+	classList.toggle('__fb-dark-mode', useDarkColors);
+	classList.toggle('__fb-light-mode', !useDarkColors);
+
+	const oppositeTheme = useDarkColors ? '__fb-light-mode' : '__fb-dark-mode';
+	for (const element of document.querySelectorAll(`.${oppositeTheme}`)) {
+		element.classList.remove(oppositeTheme);
+	}
+}
+
 async function setTheme(): Promise<void> {
-	type ThemeSource = typeof nativeTheme.themeSource;
-	const theme = await ipc.callMain<undefined, ThemeSource>('get-config-theme');
-	nativeTheme.themeSource = theme;
-	setThemeElement(document.documentElement);
-	updateVibrancy();
-}
-
-function setThemeElement(element: HTMLElement): void {
-	const useDarkColors = Boolean(nativeTheme.shouldUseDarkColors);
-	element.classList.toggle('dark-mode', useDarkColors);
-	element.classList.toggle('light-mode', !useDarkColors);
-	element.classList.toggle('__fb-dark-mode', useDarkColors);
-	element.classList.toggle('__fb-light-mode', !useDarkColors);
-	removeThemeClasses(useDarkColors);
-}
-
-function removeThemeClasses(useDarkColors: boolean): void {
-	// TODO: Workaround for Facebooks buggy frontend
-	// The ui sometimes hardcodes ligth mode classes in the ui. This removes them so the class
-	// in the root element would be used.
-	const className = useDarkColors ? '__fb-light-mode' : '__fb-dark-mode';
-	for (const element of document.querySelectorAll(`.${className}`)) {
-		element.classList.remove(className);
-	}
-}
-
-async function observeTheme(): Promise<void> {
-	/* Main document's class list */
-	const observer = new MutationObserver((records: MutationRecord[]) => {
-		// Find records that had class attribute changed
-		const classRecords = records.filter(record => record.type === 'attributes' && record.attributeName === 'class');
-		// Check if dark mode classes exists
-		const isDark = classRecords.some(record => {
-			const {classList} = (record.target as HTMLElement);
-			return classList.contains('dark-mode') && classList.contains('__fb-dark-mode');
-		});
-		// If config and class list don't match, update class list
-		if (nativeTheme.shouldUseDarkColors !== isDark) {
-			setTheme();
-		}
-	});
-
-	observer.observe(document.documentElement, {attributes: true, attributeFilter: ['class']});
-
-	/* Added nodes (dialogs, etc.) */
-	const observerNew = new MutationObserver((records: MutationRecord[]) => {
-		const nodeRecords = records.filter(record => record.addedNodes.length > 0);
-		for (const nodeRecord of nodeRecords) {
-			for (const newNode of nodeRecord.addedNodes) {
-				const {classList} = (newNode as HTMLElement);
-				const isLight = classList.contains('light-mode') || classList.contains('__fb-light-mode');
-				if (nativeTheme.shouldUseDarkColors === isLight) {
-					setThemeElement(newNode as HTMLElement);
-				}
-			}
-		}
-	});
-
-	/* Observe only elements where new nodes may need dark mode */
-	const menuElements = await elementReady('.j83agx80.cbu4d94t.l9j0dhe7.jgljxmt5.be9z9djy > div:nth-of-type(2) > div', {stopOnDomReady: false});
-	if (menuElements) {
-		observerNew.observe(menuElements, {childList: true});
-	}
-
-	const modalElements = await elementReady(selectors.preferencesSelector, {stopOnDomReady: false});
-	if (modalElements) {
-		observerNew.observe(modalElements, {childList: true});
-	}
-}
-
-async function setPrivateMode(): Promise<void> {
-	const privateMode = await ipc.callMain<undefined, boolean>('get-config-privateMode');
-	document.documentElement.classList.toggle('private-mode', privateMode);
-
-	if (is.macos) {
-		sendConversationList();
+	const theme = await callMain<undefined, ThemeSource>('get-config-theme');
+	const dark = theme === 'dark' || (theme === 'system' && await callMain<undefined, boolean>('get-system-dark-mode'));
+	if (isMessagesPage()) {
+		useDarkColors = dark;
+		applyTheme();
+		await updateVibrancy();
 	}
 }
 
 async function updateVibrancy(): Promise<void> {
-	const {classList} = document.documentElement;
-
-	classList.remove('sidebar-vibrancy', 'full-vibrancy');
-
-	const vibrancy = await ipc.callMain<undefined, 'sidebar' | 'none' | 'full'>('get-config-vibrancy');
-
-	switch (vibrancy) {
-		case 'sidebar': {
-			classList.add('sidebar-vibrancy');
-			break;
-		}
-
-		case 'full': {
-			classList.add('full-vibrancy');
-			break;
-		}
-
-		default:
+	if (!isMac) {
+		return;
 	}
 
-	ipc.callMain('set-vibrancy');
+	const vibrancy = await callMain<undefined, 'sidebar' | 'none' | 'full'>('get-config-vibrancy');
+	if (!isMessagesPage()) {
+		return;
+	}
+
+	const {classList} = document.documentElement;
+	classList.toggle('sidebar-vibrancy', vibrancy === 'sidebar');
+	classList.toggle('full-vibrancy', vibrancy === 'full');
+	await callMain('set-vibrancy');
+}
+
+async function setPrivateMode(): Promise<void> {
+	const privateMode = await callMain<undefined, boolean>('get-config-privateMode');
+	if (!isMessagesPage()) {
+		return;
+	}
+
+	document.documentElement.classList.toggle('private-mode', privateMode);
+	if (isMac) {
+		await sendConversationList();
+	}
 }
 
 async function updateSidebar(): Promise<void> {
+	const sidebar = await callMain<undefined, 'default' | 'hidden' | 'narrow' | 'wide'>('get-config-sidebar');
+	if (!isMessagesPage()) {
+		return;
+	}
+
 	const {classList} = document.documentElement;
+	classList.toggle('sidebar-hidden', sidebar === 'hidden');
+	classList.toggle('sidebar-force-narrow', sidebar === 'narrow');
+	classList.toggle('sidebar-force-wide', sidebar === 'wide');
+}
 
-	classList.remove('sidebar-hidden', 'sidebar-force-narrow', 'sidebar-force-wide');
-
-	const sidebar = await ipc.callMain<undefined, 'default' | 'hidden' | 'narrow' | 'wide'>('get-config-sidebar');
-
-	switch (sidebar) {
-		case 'hidden': {
-			classList.add('sidebar-hidden');
-			break;
-		}
-
-		case 'narrow': {
-			classList.add('sidebar-force-narrow');
-			break;
-		}
-
-		case 'wide': {
-			classList.add('sidebar-force-wide');
-			break;
-		}
-
-		default:
+async function updateMessageButtons(): Promise<void> {
+	const showMessageButtons = await callMain<undefined, boolean>('get-config-showMessageButtons');
+	if (isMessagesPage()) {
+		document.body?.classList.toggle('show-message-buttons', !showMessageButtons);
 	}
 }
 
-async function updateDoNotDisturb(): Promise<void> {
-	/* TODO: Implement this function
-	const shouldClosePreferences = await openHiddenPreferences();
+answerInMessages('update-sidebar', updateSidebar);
+answerInMessages('set-theme', setTheme);
+answerInMessages('set-private-mode', setPrivateMode);
+answerInMessages('update-vibrancy', updateVibrancy);
+answerInMessages('toggle-message-buttons', updateMessageButtons);
 
-	if (shouldClosePreferences) {
-		await closePreferences();
-	}
-	*/
-}
-
-function renderOverlayIcon(messageCount: number): HTMLCanvasElement {
+ipc.answerMain('render-overlay-icon', (messageCount: number): {data: string; text: string} => {
 	const canvas = document.createElement('canvas');
-	canvas.height = 128;
 	canvas.width = 128;
-	canvas.style.letterSpacing = '-5px';
-
+	canvas.height = 128;
 	const context = canvas.getContext('2d')!;
 	context.fillStyle = '#f42020';
 	context.beginPath();
@@ -449,386 +383,120 @@ function renderOverlayIcon(messageCount: number): HTMLCanvasElement {
 	context.fillStyle = 'white';
 	context.font = '90px sans-serif';
 	context.fillText(String(Math.min(99, messageCount)), 64, 96);
-
-	return canvas;
-}
-
-ipc.answerMain('update-sidebar', () => {
-	updateSidebar();
+	return {data: canvas.toDataURL(), text: String(messageCount)};
 });
-
-ipc.answerMain('set-theme', setTheme);
-
-ipc.answerMain('set-private-mode', setPrivateMode);
-
-ipc.answerMain('update-vibrancy', () => {
-	updateVibrancy();
-});
-
-ipc.answerMain('render-overlay-icon', (messageCount: number): {data: string; text: string} => ({
-	data: renderOverlayIcon(messageCount).toDataURL(),
-	text: String(messageCount),
-}));
 
 ipc.answerMain('render-native-emoji', (emoji: string): string => {
 	const canvas = document.createElement('canvas');
-	const context = canvas.getContext('2d')!;
-	const systemFont = is.linux ? 'emoji, system-ui' : 'system-ui';
 	canvas.width = 256;
 	canvas.height = 256;
+	const context = canvas.getContext('2d')!;
+	const systemFont = isLinux ? 'emoji, system-ui' : 'system-ui';
 	context.textAlign = 'center';
-	context.textBaseline = 'middle';
-	if (is.macos) {
-		context.font = `256px ${systemFont}`;
-		context.fillText(emoji, 128, 154);
-	} else {
-		context.textBaseline = 'bottom';
-		context.font = `225px ${systemFont}`;
-		context.fillText(emoji, 128, 256);
-	}
-
-	const dataUrl = canvas.toDataURL();
-	return dataUrl;
+	context.textBaseline = isMac ? 'middle' : 'bottom';
+	context.font = `${isMac ? 256 : 225}px ${systemFont}`;
+	context.fillText(emoji, 128, isMac ? 154 : 256);
+	return canvas.toDataURL();
 });
 
-ipc.answerMain('zoom-reset', async () => {
-	await setZoom(1);
-});
-
-ipc.answerMain('zoom-in', async () => {
-	let zoomFactor = await ipc.callMain<undefined, number>('get-config-zoomFactor');
-	zoomFactor += 0.1;
-
-	if (zoomFactor < 1.6) {
-		await setZoom(zoomFactor);
+function applyZoom(zoomFactor: number): void {
+	if (isMessagesPage() && Number.isFinite(zoomFactor)) {
+		document.documentElement.style.setProperty('--caprine-conversation-zoom', String(zoomFactor));
 	}
-});
-
-ipc.answerMain('zoom-out', async () => {
-	let zoomFactor = await ipc.callMain<undefined, number>('get-config-zoomFactor');
-	zoomFactor -= 0.1;
-
-	if (zoomFactor >= 0.8) {
-		await setZoom(zoomFactor);
-	}
-});
-
-ipc.answerMain('jump-to-conversation', async (key: number) => {
-	await jumpToConversation(key);
-});
-
-async function nextConversation(): Promise<void> {
-	const index = selectedConversationIndex(1);
-
-	if (index !== -1) {
-		await selectConversation(index);
-	}
-}
-
-async function previousConversation(): Promise<void> {
-	const index = selectedConversationIndex(-1);
-
-	if (index !== -1) {
-		await selectConversation(index);
-	}
-}
-
-async function jumpToConversation(key: number): Promise<void> {
-	const index = key - 1;
-	await selectConversation(index);
-}
-
-// Focus on the conversation with the given index
-async function selectConversation(index: number): Promise<void> {
-	const list = await elementReady(selectors.conversationList, {stopOnDomReady: false});
-
-	if (!list) {
-		console.error('Could not find conversations list', selectors.conversationList);
-		return;
-	}
-
-	const conversation = list.children[index];
-
-	if (!conversation) {
-		console.error('Could not find conversation', index);
-		return;
-	}
-
-	conversation.querySelector<HTMLLegendElement>('[role=link]')!.click();
-}
-
-function selectedConversationIndex(offset = 0): number {
-	const selected = document.querySelector<HTMLElement>(selectors.selectedConversation);
-
-	if (!selected) {
-		return -1;
-	}
-
-	const newSelected = selected.closest(`${selectors.conversationList} > div`)!;
-
-	const list = [...newSelected.parentNode!.children];
-	const index = list.indexOf(newSelected) + offset;
-
-	return ((index % list.length) + list.length) % list.length;
 }
 
 async function setZoom(zoomFactor: number): Promise<void> {
-	const node = document.querySelector<HTMLElement>('#zoomFactor')!;
-	node.textContent = `${selectors.conversationSelector} {zoom: ${zoomFactor} !important}`;
-	await ipc.callMain<number, void>('set-config-zoomFactor', zoomFactor);
-}
-
-async function withConversationMenu(callback: () => void): Promise<void> {
-	// eslint-disable-next-line @typescript-eslint/ban-types
-	let menuButton: HTMLElement | null = null;
-	const conversation = document.querySelector<HTMLElement>(selectors.selectedConversation)!.closest(`${selectors.conversationList} > div`);
-
-	menuButton = conversation?.querySelector('[aria-label=Menu][role=button]') ?? null;
-
-	if (menuButton) {
-		await withMenu(menuButton, callback);
+	applyZoom(zoomFactor);
+	if (isMessagesPage()) {
+		await callMain<number, void>('set-config-zoomFactor', zoomFactor);
 	}
 }
 
-async function openMuteModal(): Promise<void> {
-	await withConversationMenu(() => {
-		selectMenuItem(2);
-	});
-}
-
-/*
-These functions assume:
-- There is a selected conversation.
-- That the conversation already has its conversation menu open.
-
-In other words, you should only use this function within a callback that is provided to `withConversationMenu()`, because `withConversationMenu()` makes sure to have the conversation menu open before executing the callback and closes the conversation menu afterwards.
-*/
-function isSelectedConversationGroup(): boolean {
-	// Individual conversations include an entry for "View Profile", which is type `a`
-	return !document.querySelector<HTMLElement>(`${selectors.conversationMenuSelectorNewDesign} a[role=menuitem]`);
-}
-
-function isSelectedConversationMetaAI(): boolean {
-	// Meta AI menu only has 1 separator of type `hr`
-	return !document.querySelector<HTMLElement>(`${selectors.conversationMenuSelectorNewDesign} hr:nth-of-type(2)`);
-}
-
-async function archiveSelectedConversation(): Promise<void> {
-	await withConversationMenu(() => {
-		const [isGroup, isNotGroup, isMetaAI] = [-4, -3, -2];
-
-		let archiveMenuIndex;
-		if (isSelectedConversationMetaAI()) {
-			archiveMenuIndex = isMetaAI;
-		} else if (isSelectedConversationGroup()) {
-			archiveMenuIndex = isGroup;
-		} else {
-			archiveMenuIndex = isNotGroup;
-		}
-
-		selectMenuItem(archiveMenuIndex);
-	});
-}
-
-async function deleteSelectedConversation(): Promise<void> {
-	await withConversationMenu(() => {
-		const [isGroup, isNotGroup, isMetaAI] = [-3, -2, -1];
-
-		let deleteMenuIndex;
-		if (isSelectedConversationMetaAI()) {
-			deleteMenuIndex = isMetaAI;
-		} else if (isSelectedConversationGroup()) {
-			deleteMenuIndex = isGroup;
-		} else {
-			deleteMenuIndex = isNotGroup;
-		}
-
-		selectMenuItem(deleteMenuIndex);
-	});
-}
-
-async function openPreferences(): Promise<void> {
-	await withSettingsMenu(() => {
-		selectMenuItem(1);
-	});
-
-	await elementReady(selectors.preferencesSelector, {stopOnDomReady: false});
-}
-
-function isPreferencesOpen(): boolean {
-	return Boolean(document.querySelector<HTMLElement>(selectors.preferencesSelector));
-}
-
-async function closePreferences(): Promise<void> {
-	// Wait for the preferences window to be closed, then remove the class from the document
-	const preferencesOverlayObserver = new MutationObserver(records => {
-		const removedRecords = records.filter(({removedNodes}) => removedNodes.length > 0 && (removedNodes[0] as HTMLElement).tagName === 'DIV');
-
-		// In case there is a div removed, hide utility class and stop observing
-		if (removedRecords.length > 0) {
-			document.documentElement.classList.remove('hide-preferences-window');
-			preferencesOverlayObserver.disconnect();
-		}
-	});
-
-	const preferencesOverlay = document.querySelector(selectors.preferencesSelector)!;
-
-	// Get the parent of preferences, that's not getting deleted
-	const preferencesParent = preferencesOverlay.closest('div:not([class])')!;
-
-	preferencesOverlayObserver.observe(preferencesParent, {childList: true});
-
-	const closeButton = preferencesOverlay.querySelector(selectors.closePreferencesButton)!;
-	(closeButton as HTMLElement)?.click();
-}
-
-function insertionListener(event: AnimationEvent): void {
-	if (event.animationName === 'nodeInserted' && event.target) {
-		event.target.dispatchEvent(new Event('mouseover', {bubbles: true}));
+async function stepZoom(amount: number): Promise<void> {
+	const zoom = await callMain<undefined, number>('get-config-zoomFactor');
+	const next = Math.round((zoom + amount) * 10) / 10;
+	if (next >= 0.8 && next <= 1.5) {
+		await setZoom(next);
 	}
 }
 
-async function observeAutoscroll(): Promise<void> {
-	const mainElement = await elementReady('._4sp8', {stopOnDomReady: false});
-	if (!mainElement) {
+answerInMessages('zoom-reset', async () => setZoom(1));
+answerInMessages('zoom-in', async () => stepZoom(0.1));
+answerInMessages('zoom-out', async () => stepZoom(-0.1));
+
+function updateLayout(): void {
+	if (!isMessagesPage()) {
+		document.documentElement.classList.remove('caprine-messages');
 		return;
 	}
 
-	const scrollToBottom = (): void => {
-		// eslint-disable-next-line @typescript-eslint/ban-types
-		const scrollableElement: HTMLElement | null = document.querySelector('[role=presentation] .scrollable');
-		if (scrollableElement) {
-			scrollableElement.scroll({
-				top: Number.MAX_SAFE_INTEGER,
-				behavior: 'smooth',
-			});
-		}
-	};
+	const {classList} = document.documentElement;
+	if (!classList.contains('caprine-messages')) {
+		classList.add('caprine-messages');
+	}
 
-	const hookMessageObserver = async (): Promise<void> => {
-		const chatElement = await elementReady(
-			'[role=presentation] .scrollable [role = region] > div[id ^= "js_"]', {stopOnDomReady: false},
-		);
+	const container = queryConversationNavigation()?.parentElement;
+	if (container && !container.classList.contains('caprine-thread-list-container')) {
+		container.classList.add('caprine-thread-list-container');
+	}
 
-		if (chatElement) {
-			// Scroll to the bottom when opening different conversation
-			scrollToBottom();
+	const titlebar = query('[role=navigation] .x78zum5.xdt5ytf.xzd29fr');
+	if (titlebar && !titlebar.classList.contains('caprine-titlebar')) {
+		titlebar.classList.add('caprine-titlebar');
+	}
 
-			const messageObserver = new MutationObserver((record: MutationRecord[]) => {
-				const newMessages: MutationRecord[] = record.filter(record =>
-					// The mutation is an addition
-					record.addedNodes.length > 0
-						// ... of a div       (skip the "seen" status change)
-						&& (record.addedNodes[0] as HTMLElement).tagName === 'DIV'
-						// ... on the last child       (skip previous messages added when scrolling up)
-						&& chatElement.lastChild!.contains(record.target),
-				);
-
-				if (newMessages.length > 0) {
-					// Scroll to the bottom when there are new messages
-					scrollToBottom();
-				}
-			});
-
-			messageObserver.observe(chatElement, {childList: true, subtree: true});
-		}
-	};
-
-	hookMessageObserver();
-
-	// Hook it again if conversation changes
-	const conversationObserver = new MutationObserver(hookMessageObserver);
-	conversationObserver.observe(mainElement, {childList: true});
+	applyTheme();
 }
 
-async function observeThemeBugs(): Promise<void> {
-	const rootObserver = new MutationObserver((record: MutationRecord[]) => {
-		const newNodes: MutationRecord[] = record
-			.filter(record => record.addedNodes.length > 0 || record.removedNodes.length > 0);
+function initialize(): void {
+	const root = document.documentElement;
+	root.classList.add(`os-${process.platform}`);
+	let initialized = false;
+	let updatePending = false;
 
-		if (newNodes) {
-			removeThemeClasses(Boolean(nativeTheme.shouldUseDarkColors));
+	function update(): void {
+		updateLayout();
+		if (!isMessagesPage() || initialized) {
+			return;
 		}
-	});
 
-	rootObserver.observe(document.documentElement, {childList: true, subtree: true});
-}
-
-// Listen for emoji element dom insertion
-document.addEventListener('animationstart', insertionListener, false);
-
-// Inject a global style node to maintain custom appearance after conversation change or startup
-document.addEventListener('DOMContentLoaded', async () => {
-	const style = document.createElement('style');
-	style.id = 'zoomFactor';
-	document.body.append(style);
-
-	// Set the zoom factor if it was set before quitting
-	const zoomFactor = await ipc.callMain<undefined, number>('get-config-zoomFactor');
-	setZoom(zoomFactor);
-
-	// Enable OS specific styles
-	document.documentElement.classList.add(`os-${process.platform}`);
-
-	// Restore sidebar view state to what is was set before quitting
-	updateSidebar();
-
-	// Activate Dark Mode if it was set before quitting
-	setTheme();
-	// Observe for dark mode changes
-	observeTheme();
-
-	// Activate Private Mode if it was set before quitting
-	setPrivateMode();
-
-	// Configure do not disturb
-	if (is.macos) {
-		await updateDoNotDisturb();
-	}
-
-	// Prevent flash of white on startup when in dark mode
-	// TODO: find a CSS-only solution
-	if (!is.macos && nativeTheme.shouldUseDarkColors) {
-		document.documentElement.style.backgroundColor = '#1e1e1e';
-	}
-
-	// Disable autoplay if set in settings
-	toggleVideoAutoplay();
-
-	// Hook auto-scroll observer
-	observeAutoscroll();
-
-	// Hook broken dark mode observer
-	observeThemeBugs();
-});
-
-// Handle title bar double-click.
-window.addEventListener('dblclick', (event: Event) => {
-	const target = event.target as HTMLElement;
-	const titleBar = target.closest('._36ic._5l-3,._5742,._6-xk,._673w');
-
-	if (!titleBar) {
-		return;
-	}
-
-	ipc.callMain('titlebar-doubleclick');
-}, {
-	passive: true,
-});
-
-window.addEventListener('load', async () => {
-	if (location.pathname.startsWith('/login')) {
-		const keepMeSignedInCheckbox = document.querySelector<HTMLInputElement>('[id^="u_0_0"]')!;
-		const keepMeSignedInConfig = await ipc.callMain<undefined, boolean>('get-config-keepMeSignedIn');
-		keepMeSignedInCheckbox.checked = keepMeSignedInConfig;
-		keepMeSignedInCheckbox.addEventListener('change', async () => {
-			const keepMeSignedIn = await ipc.callMain<undefined, boolean>('get-config-keepMeSignedIn');
-			await ipc.callMain('set-config-keepMeSignedIn', keepMeSignedIn);
+		initialized = true;
+		void Promise.all([
+			callMain<undefined, number>('get-config-zoomFactor').then(applyZoom),
+			setTheme(),
+			setPrivateMode(),
+			updateSidebar(),
+			updateMessageButtons(),
+			toggleVideoAutoplay(),
+		]).catch(error => {
+			console.error('Could not restore Caprine Messages settings', error);
 		});
+		observeConversationList();
+	}
+
+	const observer = new MutationObserver(() => {
+		if (!updatePending) {
+			updatePending = true;
+			requestAnimationFrame(() => {
+				updatePending = false;
+				update();
+			});
+		}
+	});
+
+	observer.observe(root, {attributes: true, attributeFilter: ['class']});
+	observer.observe(document.body, {childList: true, subtree: true});
+	update();
+}
+
+document.addEventListener('DOMContentLoaded', initialize, {once: true});
+
+document.addEventListener('animationstart', event => {
+	if (isMessagesPage() && event.animationName === 'nodeInserted') {
+		event.target?.dispatchEvent(new Event('mouseover', {bubbles: true}));
 	}
 });
 
-// Toggles styles for inactive window
 window.addEventListener('blur', () => {
 	document.documentElement.classList.add('is-window-inactive');
 });
@@ -836,118 +504,125 @@ window.addEventListener('focus', () => {
 	document.documentElement.classList.remove('is-window-inactive');
 });
 
-// It's not possible to add multiple accelerators
-// so this needs to be done the old-school way
-document.addEventListener('keydown', async event => {
-	// The `!event.altKey` part is a workaround for https://github.com/electron/electron/issues/13895
-	const combineKey = is.macos ? event.metaKey : event.ctrlKey && !event.altKey;
+window.addEventListener('dblclick', event => {
+	if (isMessagesPage() && event.target instanceof Element && event.target.closest('.caprine-titlebar')) {
+		void callMain('titlebar-doubleclick');
+	}
+}, {passive: true});
 
-	if (!combineKey) {
+document.addEventListener('click', event => {
+	if (!event.isTrusted || !isMessagesPage() || !(event.target instanceof Element) || !event.target.closest('[role=main]')) {
 		return;
 	}
 
-	if (event.key === ']') {
-		await nextConversation();
+	const link = event.target.closest<HTMLAnchorElement>('a[href]');
+	if (!link || link.hasAttribute('download') || event.target.closest('img')) {
+		return;
 	}
 
-	if (event.key === '[') {
-		await previousConversation();
+	const href = link.getAttribute('href');
+	if (!href || href.startsWith('#') || classifyUrl(link.href) !== 'external') {
+		return;
 	}
 
-	const number = Number.parseInt(event.code.slice(-1), 10);
+	const url = externalUrl(link.href);
+	if (url && classifyUrl(url) === 'external') {
+		event.preventDefault();
+		event.stopPropagation();
+		void callMain('open-external', url);
+	}
+}, {capture: true});
 
-	if (number >= 1 && number <= 9) {
-		await jumpToConversation(number);
+document.addEventListener('keydown', event => {
+	const combineKey = isMac ? event.metaKey : event.ctrlKey && !event.altKey;
+	if (!isMessagesPage() || !combineKey || event.defaultPrevented || event.isComposing) {
+		return;
+	}
+
+	if (event.key === '[' || event.key === ']') {
+		event.preventDefault();
+		stepConversation(event.key === '[' ? -1 : 1);
+	} else if (/^[1-9]$/.test(event.key)) {
+		event.preventDefault();
+		selectConversation(Number(event.key) - 1);
 	}
 });
 
-// Pass events sent via `window.postMessage` on to the main process
-window.addEventListener('message', async ({data: {type, data}}) => {
-	if (type === 'notification') {
-		showNotification(data as NotificationEvent);
+function sameConversation(left: string, right: string): boolean {
+	if (!isMessagesThreadUrl(left) || !isMessagesThreadUrl(right)) {
+		return false;
 	}
 
-	if (type === 'notification-reply') {
-		await sendReply(data.reply as string);
+	const normalize = (url: string) => new URL(url).pathname.replace(/\/$/, '');
+	return normalize(left) === normalize(right);
+}
 
-		if (data.previousConversation) {
-			await selectConversation(data.previousConversation as number);
-		}
-	}
-});
-
-function showNotification({id, title, body, icon, silent}: NotificationEvent): void {
-	const image = new Image();
-	image.crossOrigin = 'anonymous';
-	image.src = icon;
-
-	image.addEventListener('load', () => {
-		const canvas = document.createElement('canvas');
-		const context = canvas.getContext('2d')!;
-
-		canvas.width = image.width;
-		canvas.height = image.height;
-
-		context.drawImage(image, 0, 0, image.width, image.height);
-
-		ipc.callMain('notification', {
-			id,
-			title,
-			body,
-			icon: canvas.toDataURL(),
-			silent,
-		});
+function findConversation(conversationUrl: string): HTMLAnchorElement | undefined {
+	return getConversationLinks().find(link => {
+		const url = getConversationUrl(link);
+		return url && sameConversation(url, conversationUrl);
 	});
 }
 
-async function sendReply(message: string): Promise<void> {
-	const inputField = document.querySelector<HTMLElement>('[contenteditable="true"]');
-	if (!inputField) {
+async function replyToConversation(conversationUrl: string, reply: string): Promise<void> {
+	const link = findConversation(conversationUrl);
+	if (!link) {
 		return;
 	}
 
-	const previousMessage = inputField.textContent;
+	const previousComposer = query(selectors.composer);
+	const changingConversation = !sameConversation(location.href, conversationUrl);
+	if (changingConversation) {
+		link.click();
+	}
 
-	// Send message
-	inputField.focus();
-	insertMessageText(message, inputField);
+	const composer = await waitFor(() => {
+		const current = query(selectors.composer);
+		if (sameConversation(location.href, conversationUrl)
+			&& findConversation(conversationUrl)?.getAttribute('aria-current') === 'page'
+			&& (!changingConversation || previousComposer !== current)) {
+			return current;
+		}
 
-	const sendButton = await elementReady<HTMLElement>('._30yy._38lh', {stopOnDomReady: false});
-	if (!sendButton) {
-		console.error('Could not find send button');
+		return undefined;
+	});
+
+	if (!composer) {
 		return;
 	}
 
-	sendButton.click();
+	const hasDraft = (composer.textContent ?? '').trim().length > 0 || Boolean(composer.querySelector('img, [contenteditable=false]'));
+	if (hasDraft || query(selectors.send)) {
+		return;
+	}
 
-	// Restore (possible) previous message
-	if (previousMessage) {
-		insertMessageText(previousMessage, inputField);
+	composer.focus();
+	if (document.activeElement !== composer || !document.execCommand('insertText', false, reply)) {
+		return;
+	}
+
+	const canSend = () => sameConversation(location.href, conversationUrl)
+		&& query(selectors.composer) === composer
+		&& composer.textContent === reply;
+	const send = await waitFor(() => canSend() ? query(selectors.send) : undefined);
+	if (send && canSend()) {
+		send.click();
+	} else if (canSend() && document.activeElement === composer) {
+		document.getSelection()?.selectAllChildren(composer);
+		document.execCommand('delete');
 	}
 }
 
-function insertMessageText(text: string, inputField: HTMLElement): void {
-	// Workaround: insert placeholder value to get execCommand working
-	if (!inputField.textContent) {
-		const event = new InputEvent('textInput', {
-			bubbles: true,
-			cancelable: true,
-			data: '_',
-			view: window,
-		});
-		inputField.dispatchEvent(event);
+let replyInProgress = false;
+answerInMessages('notification-reply-callback', async ({conversationUrl, reply}: {conversationUrl: string; reply: string}) => {
+	if (replyInProgress || !isMessagesThreadUrl(conversationUrl) || typeof reply !== 'string' || !reply.trim()) {
+		return;
 	}
 
-	document.execCommand('selectAll', false, undefined);
-	document.execCommand('insertText', false, text);
-}
-
-ipc.answerMain('notification-callback', (data: unknown) => {
-	window.postMessage({type: 'notification-callback', data}, '*');
-});
-
-ipc.answerMain('notification-reply-callback', async (data: any) => {
-	const previousConversation = selectedConversationIndex();
-	data.previousConversation = previousConversation;
-	window.postMessage({type: 'notification-reply-callback', data}, '*');
+	replyInProgress = true;
+	try {
+		await replyToConversation(conversationUrl, reply);
+	} finally {
+		replyInProgress = false;
+	}
 });
